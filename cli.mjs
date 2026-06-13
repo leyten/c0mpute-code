@@ -292,7 +292,7 @@ const LABELS = { read: 'Read', list: 'List', search: 'Search', edit: 'Update', w
 async function runTask(task, history) {
   console.log('');
   history.push({ role: 'user', content: task });
-  let ran = false, nudges = 0;
+  let ran = false, nudges = 0, lastRunFailed = false, doneNudges = 0;
   busy = true; interrupted = false;
   // is this a coding task (enforce actions) or chat/greeting (a prose reply is fine)?
   const isCoding = /\b(fix|bug|error|fail|implement|add|refactor|test|debug|rename|update|create|build|install|broken|crash|exception|traceback|function|class|import|run)\b/i.test(task) || /[\w./-]+\.\w{1,5}\b/.test(task);
@@ -312,7 +312,11 @@ async function runTask(task, history) {
     }
     nudges = 0;
     const { verb, arg } = act;
-    if (verb === 'done') { ran = true; break; }
+    if (verb === 'done') {
+      // don't accept "done" while the last command was still failing — that's a false finish
+      if (lastRunFailed && doneNudges < 2) { doneNudges++; history.push({ role: 'user', content: 'The last command reported failures/errors, so the task is NOT verified. Keep fixing and re-run the test until it passes. If you are genuinely stuck, say plainly what is still broken instead of using `done`.' }); continue; }
+      ran = true; break;
+    }
     const path0 = arg.split(/\s+/)[0] || '';
     const shown = verb === 'search' ? arg : (verb === 'run' ? (arg || act.body.split('\n')[0]) : path0);
     console.log(`${MARK} ${c.b(LABELS[verb])}${c.gry('(')}${c.gry(shown)}${c.gry(')')}`);
@@ -331,7 +335,8 @@ async function runTask(task, history) {
     else if (verb === 'search') { res = toolSearch(arg); obs = res.err || `matches for "${arg}":\n${res.out}`; }
     else if (verb === 'edit') { res = toolEdit(arg, act.body); obs = res.err || res.out; if (!res.err) ran = true; }
     else if (verb === 'write') { res = toolWrite(path0, act.body); obs = res.err || res.out; if (!res.err) ran = true; }
-    else { const cmd = arg || act.body; const out = sh(cmd); res = { out }; obs = `$ ${cmd}\n${clip(out, 3000)}`; ran = true; }
+    else { const cmd = arg || act.body; const out = sh(cmd); res = { out }; obs = `$ ${cmd}\n${clip(out, 3000)}`; ran = true; lastRunFailed = /^exit [1-9]/.test(out) || /\b[1-9]\d* (?:failed|error)/i.test(out); }
+    if (verb === 'edit' || verb === 'write') lastRunFailed = true;  // changed code but haven't re-verified yet
 
     // render result under the action
     if (res.err) console.log(`  ${c.gry('⎿')}  ${c.red(res.err.split('\n')[0])}`);
