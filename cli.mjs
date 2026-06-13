@@ -6,7 +6,7 @@
 //
 //   C0MPUTE_API_KEY=sk-... c0mpute-code            # interactive
 //   C0MPUTE_API_KEY=sk-... c0mpute-code "task"     # one task, then exit
-import { execSync } from 'child_process';
+import { spawnSync } from 'child_process';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync } from 'fs';
 import { createInterface } from 'readline';
 import { stdin, stdout } from 'process';
@@ -57,7 +57,37 @@ const redact = (t) => { let s = String(t ?? ''); for (const rx of SECRET_RX) s =
 
 // ── git / shell ──
 const isGit = existsSync(`${CWD}/.git`);
-const sh = (cmd) => { try { return execSync(cmd, { cwd: CWD, timeout: 120000, stdio: ['ignore', 'pipe', 'pipe'], shell: '/bin/bash' }).toString(); } catch (x) { return `exit ${x.status}\n${x.stdout?.toString() || ''}\n${x.stderr?.toString() || ''}`; } };
+const sh = (cmd) => {
+  const r = spawnSync('/bin/bash', ['-c', cmd], { cwd: CWD, timeout: 120000, maxBuffer: 1 << 24 });
+  if (r.error) return `error: ${r.error.code === 'ETIMEDOUT' ? 'timed out after 120s' : r.error.message}`;
+  const out = (r.stdout?.toString() || '') + (r.stderr?.toString() || '');   // tools like pytest write to stderr
+  return (r.status ? `exit ${r.status}\n` : '') + out;
+};
+
+// ── context window management ──
+// Keep what we send to the model bounded: system + recent turns in full, older tool
+// observations collapsed, oldest dropped. Lets long sessions run without blowing context.
+const CTX_BUDGET = Number(process.env.C0MPUTE_CTX_BUDGET || 48000); // chars (~12k tokens)
+function pack(history) {
+  const sys = history[0], rest = history.slice(1), out = [];
+  let total = sys.content.length;
+  for (let i = rest.length - 1; i >= 0; i--) {
+    let content = rest[i].content;
+    if (out.length >= 8 && content.length > 700) content = content.slice(0, 400) + ` …[${content.length - 400} chars trimmed]`;
+    if (total + content.length > CTX_BUDGET) { out.unshift({ role: 'user', content: '[earlier steps omitted to save context]' }); break; }
+    out.unshift({ role: rest[i].role, content }); total += content.length;
+  }
+  return [sys, ...out];
+}
+
+// ── project memory: a file the agent reads for context (and can generate via /init) ──
+const PROJECT_FILES = ['c0mpute.md', 'AGENTS.md', 'CLAUDE.md'];
+function loadProjectNotes() {
+  for (const f of PROJECT_FILES) {
+    try { const t = readFileSync(join(ROOT, f), 'utf8').trim(); if (t) return { name: f, text: t.slice(0, 4000) }; } catch {}
+  }
+  return null;
+}
 
 // ── streaming over the network ──
 const PULSE = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█', '▇', '▆', '▅', '▄', '▃', '▂']; // compute pulse
@@ -65,8 +95,9 @@ async function think(messages) {
   let i = 0, tick = null, first = false;
   if (stdout.isTTY && !process.env.C0MPUTE_NO_SPINNER) tick = setInterval(() => { if (!first) process.stdout.write('\r' + c.grn(PULSE[i++ % PULSE.length]) + ' '); }, 80);
   const stop = () => { if (tick) { clearInterval(tick); tick = null; if (stdout.isTTY) process.stdout.write('\r\x1b[K'); } };
+  currentAbort = new AbortController();
   try {
-    const r = await fetch(API, { method: 'POST', headers: { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: MODEL, messages, temperature: 0.2, max_tokens: 1024, stream: true }) });
+    const r = await fetch(API, { method: 'POST', signal: currentAbort.signal, headers: { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: MODEL, messages, temperature: 0.2, max_tokens: 1024, stream: true }) });
     if (!r.ok) throw new Error(`c0mpute API ${r.status}: ${(await r.text()).slice(0, 200)}`);
     const reader = r.body.getReader(), dec = new TextDecoder();
     let buf = '', full = '', inCode = false, shown = false, prose = '', pp = 0;
@@ -122,7 +153,8 @@ function toolRead(arg) {
   let txt; try { txt = readFileSync(abspath(path), 'utf8'); } catch (x) { return { err: `cannot read ${path}: ${x.code || x.message}` }; }
   const lines = txt.split('\n'), from = start || 1, to = end || lines.length;
   const slice = lines.slice(from - 1, to);
-  return { out: slice.map((l, i) => String(from + i).padStart(5) + '  ' + l).join('\n'), lines: slice.length, total: lines.length };
+  // visible "│" gutter so the code's real indentation is unambiguous (matters for edits)
+  return { out: slice.map((l, i) => String(from + i).padStart(4) + ' │ ' + l).join('\n'), lines: slice.length, total: lines.length };
 }
 function toolList(arg) {
   const dir = arg || '.';
@@ -136,8 +168,8 @@ function toolSearch(arg) {
   const cmd = `(command -v rg >/dev/null && rg -n --no-heading -S --max-count 6 -- ${shq(arg)} . || grep -rnI -- ${shq(arg)} . ) 2>/dev/null | head -40`;
   return { out: sh(cmd).trim() || '(no matches)' };
 }
-// strip a line-number gutter the model may have copied from a `read` ("   12  code")
-const degut = (s) => s.split('\n').map(l => l.replace(/^\s*\d+\s{2}/, '')).join('\n');
+// strip a line-number gutter the model may have copied from a `read` ("  12 │ code" or "  12  code")
+const degut = (s) => s.split('\n').map(l => l.replace(/^\s*\d+\s*│ ?/, '').replace(/^\s*\d+\s{2}/, '')).join('\n');
 // locate SEARCH in the file tolerantly (exact → de-guttered → per-line whitespace-flexible)
 function locate(txt, oldStr, newStr) {
   const uniq = (o, n) => { const i = txt.indexOf(o); return (i >= 0 && txt.indexOf(o, i + 1) < 0) ? { txt: txt.slice(0, i) + n + txt.slice(i + o.length), line: txt.slice(0, i).split('\n').length } : null; };
@@ -154,25 +186,45 @@ function locate(txt, oldStr, newStr) {
   if (count > 1) return { dup: count };
   return null;
 }
-function toolEdit(path, body) {
-  const m = body.match(/<{3,}\s*SEARCH\s*\n([\s\S]*?)\n={3,}\s*\n([\s\S]*?)\n>{3,}\s*REPLACE/);
-  if (!m) return { err: 'malformed edit block. use <<<<<<< SEARCH / ======= / >>>>>>> REPLACE' };
-  const oldStr = m[1], newStr = m[2];
+const diffRows = (start, oldL, newL) => { const rows = []; oldL.forEach((l, i) => rows.push(c.gry(String(start + i).padStart(5)) + ' ' + c.red('- ' + l))); newL.forEach((l, i) => rows.push(c.gry(String(start + i).padStart(5)) + ' ' + c.grn('+ ' + l))); return rows; };
+// after a write, check the file still parses; an edit that breaks syntax is auto-reverted
+function syntaxError(path) {
+  const ext = (path.split('.').pop() || '').toLowerCase();
+  if (ext === 'py') { const r = sh(`python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" ${shq(abspath(path))}`); return /Error/.test(r) ? (r.match(/\w*Error:.*/) || [r.trim().split('\n').pop()])[0] : null; }
+  if (['js', 'mjs', 'cjs'].includes(ext)) { const r = sh(`node --check ${shq(abspath(path))}`); return /Error/.test(r) ? (r.match(/\w*Error:.*/) || [r.trim().split('\n')[0]])[0] : null; }
+  return null;
+}
+// write newContent; if it breaks syntax, restore prior (or delete a new file) and report
+function commit(path, newContent, prior, okMsg, rows) {
+  writeFileSync(abspath(path), newContent);
+  const bad = syntaxError(path);
+  if (bad) { if (prior === null) { try { sh(`rm -f ${shq(abspath(path))}`); } catch {} } else writeFileSync(abspath(path), prior); return { err: `that change broke ${path}: ${bad.slice(0, 120)} — reverted. Re-read and fix the indentation/range.` }; }
+  return { out: okMsg, rows };
+}
+function toolEdit(arg, body) {
+  const parts = arg.split(/\s+/), path = parts[0];
   let txt; try { txt = readFileSync(abspath(path), 'utf8'); } catch (x) { return { err: `cannot read ${path}: ${x.code || x.message}` }; }
-  const loc = locate(txt, oldStr, newStr);
-  if (!loc) return { err: `SEARCH text not found in ${path}. Re-read the file and copy the exact lines WITHOUT the line-number prefix.` };
-  if (loc.dup) return { err: `SEARCH matches ${loc.dup}x in ${path}. Add more surrounding context to make it unique.` };
-  writeFileSync(abspath(path), loc.txt);
-  const oldL = degut(oldStr).split('\n'), newL = degut(newStr).split('\n'), rows = [];
-  oldL.forEach((l, i) => rows.push(c.gry(String(loc.line + i).padStart(5)) + ' ' + c.red('- ' + l)));
-  newL.forEach((l, i) => rows.push(c.gry(String(loc.line + i).padStart(5)) + ' ' + c.grn('+ ' + l)));
-  return { out: `Updated ${path} (+${newL.length} -${oldL.length})`, rows };
+  // primary form: `edit <path> <start> <end>` replaces those lines (numbers come from a read)
+  if (parts.length >= 3 && /^\d+$/.test(parts[1]) && /^\d+$/.test(parts[2])) {
+    const lines = txt.split('\n'), s = +parts[1], e = +parts[2];
+    if (s < 1 || s > e || e > lines.length) return { err: `bad range ${s}-${e}; ${path} has ${lines.length} lines. Re-read and use line numbers in range.` };
+    const oldL = lines.slice(s - 1, e), newL = degut(body).split('\n');
+    return commit(path, [...lines.slice(0, s - 1), ...newL, ...lines.slice(e)].join('\n'), txt, `Updated ${path} (+${newL.length} -${oldL.length})`, diffRows(s, oldL, newL));
+  }
+  // fallback form: SEARCH/REPLACE block
+  const m = body.match(/<{3,}\s*SEARCH\s*\n([\s\S]*?)\n={3,}\s*\n([\s\S]*?)\n>{3,}\s*REPLACE/);
+  if (!m) return { err: `edit needs either "edit ${path} <start> <end>" + the new lines, or a SEARCH/REPLACE block.` };
+  const oldStr = m[1], newStr = m[2], loc = locate(txt, oldStr, newStr);
+  if (!loc) return { err: `SEARCH text not found in ${path}. Easier: re-read it and use "edit ${path} <start> <end>" with the line numbers.` };
+  if (loc.dup) return { err: `SEARCH matches ${loc.dup}x in ${path}. Use "edit ${path} <start> <end>" with line numbers instead.` };
+  return commit(path, loc.txt, txt, `Updated ${path} (+${degut(newStr).split('\n').length} -${degut(oldStr).split('\n').length})`, diffRows(loc.line, degut(oldStr).split('\n'), degut(newStr).split('\n')));
 }
 function toolWrite(path, body) {
   const existed = existsSync(abspath(path));
-  try { mkdirSync(dirname(abspath(path)), { recursive: true }); writeFileSync(abspath(path), body.endsWith('\n') ? body : body + '\n'); }
+  let prior = null;
+  try { prior = existed ? readFileSync(abspath(path), 'utf8') : null; mkdirSync(dirname(abspath(path)), { recursive: true }); }
   catch (x) { return { err: `cannot write ${path}: ${x.code || x.message}` }; }
-  return { out: `${existed ? 'Overwrote' : 'Created'} ${path} (${body.split('\n').length} lines)` };
+  return commit(path, body.endsWith('\n') ? body : body + '\n', prior, `${existed ? 'Overwrote' : 'Created'} ${path} (${body.split('\n').length} lines)`);
 }
 
 // ── filesystem boundary ──
@@ -195,6 +247,7 @@ const allow = { all: AUTO }; const session = new Set();
 // One persistent readline for the whole session — a fresh interface per prompt
 // drops buffered/piped input and fights itself on stdin.
 let RL = null, closed = false;
+let busy = false, interrupted = false, currentAbort = null;  // ctrl-c interrupt state
 function rl() { if (!RL) { RL = createInterface({ input: stdin, output: stdout }); RL.on('close', () => { closed = true; }); } return RL; }
 const ask = (q) => new Promise(r => { if (closed) return r(''); rl().question(q, a => r(a.trim())); });
 async function permit(verb, detail, warn) {
@@ -239,12 +292,25 @@ const LABELS = { read: 'Read', list: 'List', search: 'Search', edit: 'Update', w
 async function runTask(task, history) {
   console.log('');
   history.push({ role: 'user', content: task });
-  let ran = false;
+  let ran = false, nudges = 0;
+  busy = true; interrupted = false;
+  // is this a coding task (enforce actions) or chat/greeting (a prose reply is fine)?
+  const isCoding = /\b(fix|bug|error|fail|implement|add|refactor|test|debug|rename|update|create|build|install|broken|crash|exception|traceback|function|class|import|run)\b/i.test(task) || /[\w./-]+\.\w{1,5}\b/.test(task);
+  try {
   for (let step = 1; step <= MAX_STEPS; step++) {
-    const reply = await think(history.map(m => ({ ...m, content: redact(m.content) })));
+    if (interrupted) break;
+    let reply;
+    try { reply = await think(pack(history).map(m => ({ ...m, content: redact(m.content) }))); }
+    catch (e) { if (interrupted || e.name === 'AbortError') break; throw e; }
     history.push({ role: 'assistant', content: reply });
+    if (interrupted) break;
     const act = parseAction(reply);
-    if (!act) break;                        // no action -> done / just talking
+    if (!act) {
+      // a coding task with no action means the model under-drove -> nudge it back on-protocol
+      if (isCoding && nudges < 3) { nudges++; history.push({ role: 'user', content: 'You did not emit an action. Respond with EXACTLY ONE action now in a fenced ``` block (start with `list` or `search` to find the code), or `done` if the task is verified complete.' }); continue; }
+      break;                                // conversational reply, or finished after work
+    }
+    nudges = 0;
     const { verb, arg } = act;
     if (verb === 'done') { ran = true; break; }
     const path0 = arg.split(/\s+/)[0] || '';
@@ -263,7 +329,7 @@ async function runTask(task, history) {
     if (verb === 'read') { res = toolRead(arg); obs = res.err || `${path0} (${res.lines}/${res.total} lines):\n${res.out}`; }
     else if (verb === 'list') { res = toolList(arg); obs = res.err || `${arg || '.'}:\n${res.out}`; }
     else if (verb === 'search') { res = toolSearch(arg); obs = res.err || `matches for "${arg}":\n${res.out}`; }
-    else if (verb === 'edit') { res = toolEdit(path0, act.body); obs = res.err || res.out; if (!res.err) ran = true; }
+    else if (verb === 'edit') { res = toolEdit(arg, act.body); obs = res.err || res.out; if (!res.err) ran = true; }
     else if (verb === 'write') { res = toolWrite(path0, act.body); obs = res.err || res.out; if (!res.err) ran = true; }
     else { const cmd = arg || act.body; const out = sh(cmd); res = { out }; obs = `$ ${cmd}\n${clip(out, 3000)}`; ran = true; }
 
@@ -274,8 +340,35 @@ async function runTask(task, history) {
     console.log('');
     history.push({ role: 'user', content: redact(clip(obs, 4000)) });
   }
-  if (ran) console.log(MARK + ' ' + c.dim('done') + '\n');
+  } finally { busy = false; }
+  if (interrupted) { interrupted = false; console.log(c.dim('  ⊘ stopped.') + '\n'); }
+  else if (ran) console.log(MARK + ' ' + c.dim('done') + '\n');
   else console.log('');
+}
+
+// ── /init: generate project memory deterministically (no agent loop, so it can't
+// create stray files or go off and "scaffold a new project") ──
+async function initProject() {
+  process.stdout.write('\n' + MARK + ' ' + c.dim('scanning project…') + '\n');
+  const tree = sh(`(git ls-files 2>/dev/null || find . -type f -not -path './.git/*') | head -80`);
+  const manifests = sh(`for f in README* readme* package.json pyproject.toml setup.py Cargo.toml go.mod requirements.txt Makefile; do [ -f "$f" ] && echo "=== $f ===" && head -50 "$f"; done`);
+  const srcs = sh(`(git ls-files 2>/dev/null || find . -type f) | grep -Ei '\\.(py|js|ts|jsx|tsx|go|rs|java|rb)$' | grep -vi test | head -4`).trim().split('\n').filter(Boolean);
+  let snippets = '';
+  for (const f of srcs) { const r = toolRead(f + ' 1 40'); if (!r.err) snippets += `\n=== ${f} (first 40 lines) ===\n${r.out}\n`; }
+  const ctx = `FILE TREE:\n${tree}\n\nMANIFESTS:\n${manifests}\n\nKEY SOURCE FILES:${snippets}`;
+  busy = true;
+  let md = '';
+  try {
+    md = await think([
+      { role: 'system', content: 'You write concise project notes for an AI coding agent. Output ONLY github-flavored markdown, no preamble, no code fences around the whole thing.' },
+      { role: 'user', content: `Write a c0mpute.md (under 40 lines) describing THIS project, based strictly on the facts below. Cover: what it is, the structure, how to run it, how to test it, and any conventions. Do NOT invent files, commands, or features that are not shown.\n\n${redact(clip(ctx, 8000))}` },
+    ]);
+  } catch (e) { busy = false; console.log(c.red('  ! ' + e.message)); return; }
+  busy = false;
+  const clean = md.replace(/^\s*```\w*\n?/, '').replace(/\n?```\s*$/, '').trim();
+  if (!clean) { console.log(c.red('  ! got an empty result, try again')); return; }
+  writeFileSync(join(ROOT, 'c0mpute.md'), clean + '\n');
+  console.log('\n' + MARK + ' ' + c.dim('wrote c0mpute.md — loads as project memory next run') + '\n');
 }
 
 // ── main ──
@@ -293,15 +386,20 @@ async function main() {
     const a = (await ask(`  continue here anyway? ${c.dim('(y/N)')} `)).toLowerCase();
     if (a !== 'y' && a !== 'yes') { console.log(c.dim('  exiting — cd into your project and run again.')); RL?.close(); return; }
   }
+  const notes = loadProjectNotes();
   console.log('\n' + box([
     `${MARK} ${c.b('c0mpute code')}${VERSION ? c.gry('  v' + VERSION) : ''}`,
     c.dim('your coding agent, running on the c0mpute network'),
     '',
     `${c.dim('model')}  ${MODEL}     ${c.dim('cwd')}  ${CWD.replace(homedir(), '~')}     ${c.dim(isGit ? 'git · diffs on' : 'no git')}`,
-    c.dim('edits ask first · reads run automatically · /help for more'),
+    c.dim(`edits ask first · reads run automatically${notes ? ` · memory ${notes.name}` : ''} · /help`),
   ]));
-  const history = [{ role: 'system', content: SYSTEM }];
+  const sysmsg = SYSTEM + (notes ? `\n\nPROJECT NOTES (from ${notes.name}, treat as authoritative project context):\n${notes.text}` : '');
+  const history = [{ role: 'system', content: sysmsg }];
   const fin = () => { if (redactCount) console.log(c.dim(`  ${redactCount} secret${redactCount > 1 ? 's' : ''} redacted before leaving your machine`)); };
+  // ctrl-c: interrupt a running task; at an idle prompt, exit cleanly
+  const onSig = () => { if (busy) { interrupted = true; try { currentAbort?.abort(); } catch {} process.stdout.write('\n' + c.dim('  ^C stopping…') + '\n'); } else { console.log(); fin(); try { RL?.close(); } catch {} process.exit(0); } };
+  process.on('SIGINT', onSig); rl().on('SIGINT', onSig);
   const one = process.argv.slice(2).join(' ').trim();
   if (one) { console.log('\n' + c.gry('│ ') + c.b('› ') + one); await runTask(one, history); fin(); RL?.close(); return; }
   while (true) {
@@ -310,7 +408,8 @@ async function main() {
     if (!task) continue;
     if (task === '/exit' || task === '/quit') { fin(); break; }
     if (task === '/login') { await setupKey(); continue; }
-    if (task === '/help') { console.log(c.dim('  describe a coding task; I locate, read, edit, and run tests to verify.\n  reads auto-run · edits/commands ask first · files outside this dir always ask.\n  /login set key · /exit quit')); continue; }
+    if (task === '/init') { await initProject(); continue; }
+    if (task === '/help') { console.log(c.dim('  describe a coding task; I locate, read, edit, and run tests to verify.\n  reads auto-run · edits/commands ask first · files outside this dir always ask.\n  /init write project memory · /login set key · /exit quit · ctrl-c interrupt')); continue; }
     try { await runTask(task, history); } catch (x) { console.log(c.red('  ! ' + x.message)); }
   }
   RL?.close();
@@ -335,7 +434,8 @@ clarifying question in plain text instead of poking at the filesystem.
 
 WORKING ON A TASK — begin immediately. Do NOT greet, introduce yourself, or restate your identity;
 just start working. You act as an agent in a loop. Each turn: write ONE short sentence on what
-you're doing next, then emit EXACTLY ONE action as a fenced code block. The first line inside the
+you're doing next, then emit EXACTLY ONE action as a fenced code block — ALWAYS include the action
+block in the same message; never narrate an intent without the action. The first line inside the
 block is the command. You get the result next turn, then continue. One action per turn only.
 
 Actions (the first line is literally the command):
@@ -356,16 +456,23 @@ read path/to/file.py 20 60
 Read a file. The two numbers (optional) are a start/end line range.
 
 \`\`\`
+edit path/to/file.py 16 18
+the new line(s) that replace lines 16 to 18
+\`\`\`
+PREFERRED edit form: replace lines 16-18 (inclusive, the numbers shown by \`read\`) with the body.
+Always \`read\` the file first so your line numbers are correct. In \`read\` output each line is
+"<num> │ <code>" — match the code's exact indentation (the spaces AFTER the │) in your replacement.
+Keep edits small.
+
+Alternative (when counting lines is awkward) — a SEARCH/REPLACE block:
+\`\`\`
 edit path/to/file.py
 <<<<<<< SEARCH
-the exact existing text to replace
+the exact existing text (copied from a read, WITHOUT the line-number prefix)
 =======
 the new text
 >>>>>>> REPLACE
 \`\`\`
-Replace an exact, unique snippet. The SEARCH text must match the file's lines including indentation.
-Copy it from a read, but do NOT include the line-number prefix — only the code itself. Keep edits
-small and surgical.
 
 \`\`\`
 write path/to/new_file.py

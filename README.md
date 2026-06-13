@@ -32,6 +32,13 @@ You can also pass it via the `C0MPUTE_API_KEY` env var.
 - The inference runs across the decentralized network; the dangerous parts (your files,
   your shell) never leave your machine.
 
+## Sessions
+- **Project memory**: it reads `c0mpute.md` (or `AGENTS.md` / `CLAUDE.md`) from the repo root as
+  context. Run `/init` to generate a `c0mpute.md` for the current project.
+- **Long sessions** stay within the model's context automatically (older steps are compacted).
+- **Ctrl-C** interrupts the current task and returns to the prompt; again at the prompt exits.
+- Edits are syntax-checked and auto-reverted if they would break the file.
+
 ## Options (env)
 - `C0MPUTE_API_KEY` — your c0mpute API key (required)
 - `C0MPUTE_MODEL` — model id (default `code`)
