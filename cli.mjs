@@ -28,7 +28,8 @@ const AUTO = process.env.C0MPUTE_YOLO === '1';
 // ── ansi ──
 const e = (n) => (s) => `\x1b[${n}m${s}\x1b[0m`;
 const c = { dim: e(2), bold: e(1), red: e(31), grn: e(32), yel: e(33), blu: e(34), cyn: e(36), mag: e(35), gry: e(90), b: (s) => `\x1b[1m${s}\x1b[0m` };
-const ACCENT = (s) => `\x1b[38;5;208m${s}\x1b[0m`; // c0mpute orange-ish
+// c0mpute brand: pure black, green accent (#5af78e), pixel square marker (not Claude's round/orange dot).
+const MARK = c.grn('▪');
 const vlen = (s) => s.replace(/\x1b\[[0-9;]*m/g, '').length;
 const clip = (s, n = 4000) => { s = String(s ?? ''); return s.length > n ? s.slice(0, n) + c.dim(` … +${s.length - n} chars`) : s; };
 
@@ -88,10 +89,10 @@ function label(cmd) {
 }
 
 // ── streaming over the network ──
-const WORDS = ['Brewing', 'Computing', 'Routing', 'Reasoning', 'Crunching', 'Distributing'];
+const PULSE = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█', '▇', '▆', '▅', '▄', '▃', '▂']; // compute pulse
 async function think(messages) {
-  let i = 0, tick = null, first = false; const word = WORDS[Math.floor(messages.length) % WORDS.length];
-  if (stdout.isTTY && !process.env.C0MPUTE_NO_SPINNER) tick = setInterval(() => { if (!first) process.stdout.write(`\r${ACCENT('✻')} ${c.dim(word + '… (the brain is on the c0mpute network)')}   `); }, 90);
+  let i = 0, tick = null, first = false;
+  if (stdout.isTTY && !process.env.C0MPUTE_NO_SPINNER) tick = setInterval(() => { if (!first) process.stdout.write('\r' + c.grn(PULSE[i++ % PULSE.length]) + ' '); }, 80);
   const stop = () => { if (tick) { clearInterval(tick); tick = null; if (stdout.isTTY) process.stdout.write('\r\x1b[K'); } };
   try {
     const r = await fetch(API, { method: 'POST', headers: { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: MODEL, messages, temperature: 0.2, max_tokens: 1024, stream: true }) });
@@ -165,10 +166,9 @@ async function permit(verb, detail, warn) {
 async function validateKey(k) { try { const r = await fetch(API_BASE + '/models', { headers: { Authorization: `Bearer ${k}` } }); return r.status !== 401; } catch { return true; } }
 async function setupKey() {
   console.log('\n' + box([
-    `${ACCENT('✻')} ${c.b('Welcome to c0mpute code')}`,
-    c.dim("let's get you set up — this is a one-time step"),
-    '',
-    c.dim('Get a key at c0mpute.ai → settings → API keys'),
+    `${MARK} ${c.b('c0mpute code')}`,
+    c.dim('first run. paste your api key to start.'),
+    c.dim('get one at c0mpute.ai → settings → api keys'),
   ]));
   while (true) {
     const k = (await ask(`  ${c.b('›')} paste your c0mpute API key (sk-…): `)).trim();
@@ -198,7 +198,7 @@ async function runTask(task, history) {
     if (!cmd) break;
     if (cmd.trim() === 'echo C0MPUTE_DONE') break;
     const { verb, arg, write } = label(cmd);
-    console.log(`${c.grn('●')} ${c.b(verb)}${c.gry('(')}${c.gry(arg || cmd.split('\n')[0])}${c.gry(')')}`);
+    console.log(`${MARK} ${c.b(verb)}${c.gry('(')}${c.gry(arg || cmd.split('\n')[0])}${c.gry(')')}`);
     const oob = outOfBounds(cmd);
     const ok = oob.length
       ? await permit(verb, cmd.split('\n')[0], `⚠ this touches files OUTSIDE the project: ${oob.join(', ')}`)
@@ -221,7 +221,7 @@ async function runTask(task, history) {
     console.log('');
     history.push({ role: 'user', content: `Output:\n${redact(clip(out, 3000))}` });
   }
-  if (ran) console.log(c.grn('●') + ' ' + c.dim('done') + '\n');
+  if (ran) console.log(MARK + ' ' + c.dim('done') + '\n');
   else console.log('');
 }
 
@@ -241,14 +241,10 @@ async function main() {
     if (a !== 'y' && a !== 'yes') { console.log(c.dim('  exiting — cd into your project and run again.')); RL?.close(); return; }
   }
   console.log('\n' + box([
-    `${ACCENT('✻')} ${c.b('c0mpute code')}`,
-    c.dim('decentralized coding agent — brain on the network, hands local'),
-    '',
-    `${c.dim('model:')} ${MODEL}    ${c.dim('cwd:')} ${CWD.replace(homedir(), '~')}`,
-    c.dim('sandbox: won\'t touch files outside this dir without asking'),
-    isGit ? c.dim('git repo · diffs on') : c.dim('not a git repo · diffs off'),
+    `${MARK} ${c.b('c0mpute code')}`,
+    c.dim(`${MODEL}  ·  ${CWD.replace(homedir(), '~')}  ·  ${isGit ? 'git' : 'no git'}`),
   ]));
-  console.log(c.dim('  ask me to build or fix something  ·  /login set key  ·  /exit quit'));
+  console.log(c.dim('  /help  ·  /login  ·  /exit'));
   const history = [{ role: 'system', content: SYSTEM }];
   const fin = () => { if (redactCount) console.log(c.dim(`  ${redactCount} secret${redactCount > 1 ? 's' : ''} redacted before leaving your machine`)); };
   const one = process.argv.slice(2).join(' ').trim();
@@ -265,10 +261,18 @@ async function main() {
   RL?.close();
 }
 
-const SYSTEM = `You are c0mpute code, an autonomous coding agent in a local repo at ${CWD}.
+const SYSTEM = `You are c0mpute code: an open coding agent that lives in the user's terminal and works
+on their projects (read, edit, run, debug). Your model runs on c0mpute's decentralized GPU network,
+so you can't be taken down, rate-limited, or censored. You are not Claude, ChatGPT, or Copilot.
+
+Identity: ONLY when explicitly asked who/what you are, answer briefly in plain text, e.g. "i'm
+c0mpute code, your coding agent. i work on your projects right here in the terminal, and i run on
+c0mpute's decentralized network." Never introduce yourself or restate this otherwise — for a coding
+task, skip the intro and get straight to work. Voice: lowercase "c0mpute", plain and direct, no
+hype, no emoji, no em dashes.
 
 If the user's message is a greeting, small talk, or a question that needs no file changes
-(e.g. "hey", "what can you do?", "how does this work?"), just reply in plain text with NO
+(e.g. "hey", "what are you?", "how does this work?"), just reply in plain text with NO
 code block. Do NOT explore or read files for these — only a real coding/build/debug task
 warrants running commands. When unsure whether something is a task, ask a one-line
 clarifying question in plain text instead of poking at the filesystem.
