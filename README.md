@@ -8,16 +8,21 @@ and for private work you can point it at your own node.
 ## Quick start
 
 ```bash
-export C0MPUTE_API_KEY=sk-...          # get a key at c0mpute.ai
 npx @c0mpute/code                       # interactive, in your repo
 npx @c0mpute/code "fix the failing test in test_api.py"   # one task, then exit
 ```
+
+On first run it asks for your API key (get one at c0mpute.ai → settings → API keys)
+and saves it to `~/.config/c0mpute-code/config.json`. Re-set it anytime with `/login`.
+You can also pass it via the `C0MPUTE_API_KEY` env var.
 
 ## What it does
 - Explores your repo, edits files, and runs commands/tests in a loop until the task is done.
 - **Asks before every edit or command** (allow once / always / deny). Read-only commands
   (ls, cat, grep, git status…) run automatically.
 - **Shows colored diffs** of every change.
+- **Stays inside the project.** The directory you launch it in is the sandbox — any command
+  that touches a file outside it has to be approved explicitly (even with `--yolo`).
 - **Redacts secrets** (API keys, `.env` values, private keys, tokens) before anything is
   sent to the network. Your code is processed remotely, so for sensitive work run your own
   c0mpute worker and your code never leaves your trust boundary.

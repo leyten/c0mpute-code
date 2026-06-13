@@ -7,16 +7,22 @@
 //   C0MPUTE_API_KEY=sk-... c0mpute-code            # interactive
 //   C0MPUTE_API_KEY=sk-... c0mpute-code "task"     # one task, then exit
 import { execSync } from 'child_process';
-import { existsSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { createInterface } from 'readline';
 import { stdin, stdout } from 'process';
+import { homedir } from 'os';
+import { resolve, isAbsolute, join } from 'path';
 
 // ── config ──
-const API = (process.env.C0MPUTE_API_URL || 'https://c0mpute.ai/api/v1') + '/chat/completions';
-const KEY = process.env.C0MPUTE_API_KEY;
+const API_BASE = process.env.C0MPUTE_API_URL || 'https://c0mpute.ai/api/v1';
+const API = API_BASE + '/chat/completions';
+const CFG_DIR = join(homedir(), '.config', 'c0mpute-code');
+const CFG_FILE = join(CFG_DIR, 'config.json');
+let KEY = process.env.C0MPUTE_API_KEY || '';
 const MODEL = process.env.C0MPUTE_MODEL || 'code';
 const MAX_STEPS = Number(process.env.C0MPUTE_MAX_STEPS || 40);
 const CWD = process.cwd();
+const ROOT = CWD; // the project boundary: the agent may not touch files outside this without approval
 const AUTO = process.env.C0MPUTE_YOLO === '1';
 
 // ── ansi ──
@@ -70,7 +76,13 @@ function label(cmd) {
   const first = cmd.trim().split('\n')[0];
   let m;
   if ((m = first.match(/^cat\s+(?:-\w+\s+)*([^\s|>]+)\s*$/))) return { verb: 'Read', arg: m[1], write: false };
-  if (/(?:\bsed\s+-i\b|>\s*\S|\btee\b|>>)/.test(cmd) || /^cat\s*>/.test(first)) { const f = (cmd.match(/>\s*([^\s&|;]+)/) || cmd.match(/\bsed\s+-i\b.*?\s([^\s&|;]+)\s*$/) || [])[1]; return { verb: 'Update', arg: f || '', write: true }; }
+  // a real stdout redirect to a file — not 2>/dev/null, not &>/dev/null (fd/null discards)
+  const redir = cmd.match(/(?<![0-9&])>>?\s*([^\s&|;]+)/);
+  const redirWrite = redir && redir[1] !== '/dev/null';
+  if (/\bsed\s+-i\b/.test(cmd) || /\btee\b/.test(cmd) || redirWrite || /^cat\s*>/.test(first)) {
+    const f = (cmd.match(/\bsed\s+-i\b[^\n]*?\s([^\s&|;<>]+)\s*$/) || [])[1] || (redirWrite ? redir[1] : '') || (cmd.match(/\btee\s+([^\s&|;]+)/) || [])[1];
+    return { verb: 'Update', arg: f || '', write: true };
+  }
   return { verb: 'Bash', arg: first, write: false };
 }
 
@@ -84,7 +96,7 @@ async function think(messages) {
     const r = await fetch(API, { method: 'POST', headers: { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: MODEL, messages, temperature: 0.2, max_tokens: 1024, stream: true }) });
     if (!r.ok) throw new Error(`c0mpute API ${r.status}: ${(await r.text()).slice(0, 200)}`);
     const reader = r.body.getReader(), dec = new TextDecoder();
-    let buf = '', full = '', inCode = false, shown = false;
+    let buf = '', full = '', inCode = false, shown = false, out = '', printed = 0;
     while (true) {
       const { done, value } = await reader.read(); if (done) break;
       buf += dec.decode(value, { stream: true }); const lines = buf.split('\n'); buf = lines.pop() || '';
@@ -94,7 +106,10 @@ async function think(messages) {
         if (!tok) continue;
         if (!first) { first = true; stop(); }
         full += tok;
-        if (!inCode) { if (full.includes('```')) inCode = true; else { process.stdout.write(tok.replace(/THOUGHT:?\s*/i, '').replace(/\n/g, '\n')); shown = true; } }
+        if (!inCode) {
+          if (full.includes('```')) inCode = true;
+          else { out += tok; const clean = out.replace(/\bTHOUGHT:?\s*/gi, ''); process.stdout.write(clean.slice(printed)); printed = clean.length; shown = true; }
+        }
       }
     }
     if (shown) process.stdout.write('\n');
@@ -103,15 +118,62 @@ async function think(messages) {
 }
 const parseCmd = (t) => { const m = String(t || '').match(/```(?:bash|sh)?\s*\n([\s\S]*?)```/); return m ? m[1].trim() : null; };
 
+// ── filesystem boundary ──
+// Return any path tokens in the command that resolve OUTSIDE the project root.
+// Whole-word paths only (leading space) so we don't trip on URLs like https://…
+function outOfBounds(cmd) {
+  const hits = new Set();
+  const toks = cmd.match(/(?:^|[\s=])((?:~\/|\.\.\/|\/)[^\s'"();|&<>]*)/g) || [];
+  for (let raw of toks) {
+    let t = raw.replace(/^[\s=]+/, '');
+    if (t.startsWith('~')) t = join(homedir(), t.slice(1));
+    const abs = isAbsolute(t) ? resolve(t) : resolve(ROOT, t);
+    if (abs !== ROOT && !abs.startsWith(ROOT + '/')) hits.add(t);
+  }
+  return [...hits];
+}
+
 // ── permission (Claude-style) ──
 const allow = { all: AUTO }; const session = new Set();
-const ask = (q) => new Promise(r => { const rl = createInterface({ input: stdin, output: stdout }); rl.question(q, a => { rl.close(); r(a.trim()); }); });
-async function permit(verb, detail) {
-  if (allow.all || session.has(verb)) return true;
-  console.log('\n' + box([c.b(verb + ' wants to run:'), '', c.yel(detail.slice(0, W - 8))]));
+// One persistent readline for the whole session — a fresh interface per prompt
+// drops buffered/piped input and fights itself on stdin.
+let RL = null, closed = false;
+function rl() { if (!RL) { RL = createInterface({ input: stdin, output: stdout }); RL.on('close', () => { closed = true; }); } return RL; }
+const ask = (q) => new Promise(r => { if (closed) return r(''); rl().question(q, a => r(a.trim())); });
+async function permit(verb, detail, warn) {
+  if (!warn && (allow.all || session.has(verb))) return true; // out-of-bounds always asks, even in yolo
+  console.log('\n' + box([
+    c.b(verb + ' wants to run:'), '', c.yel(detail.slice(0, W - 8)),
+    ...(warn ? ['', c.red(warn.slice(0, W - 6))] : []),
+  ]));
   const a = (await ask(`  ${c.b('1.')} yes   ${c.b('2.')} yes, don't ask again for ${verb}   ${c.b('3.')} no  › `)).toLowerCase();
-  if (a === '2') { session.add(verb); return true; }
-  return a === '1' || a === 'y' || a === '';
+  if (a === '2' && !warn) { session.add(verb); return true; }
+  return a === '1' || a === '2' || a === 'y' || a === '';
+}
+
+// ── first-run API-key setup (Claude Code-style /login) ──
+async function validateKey(k) { try { const r = await fetch(API_BASE + '/models', { headers: { Authorization: `Bearer ${k}` } }); return r.status !== 401; } catch { return true; } }
+async function setupKey() {
+  console.log('\n' + box([
+    `${ACCENT('✻')} ${c.b('Welcome to c0mpute code')}`,
+    c.dim("let's get you set up — this is a one-time step"),
+    '',
+    c.dim('Get a key at c0mpute.ai → settings → API keys'),
+  ]));
+  while (true) {
+    const k = (await ask(`  ${c.b('›')} paste your c0mpute API key (sk-…): `)).trim();
+    if (!k) continue;
+    process.stdout.write('  ' + c.dim('checking… '));
+    if (!(await validateKey(k))) { console.log(c.red('that key was rejected, try again')); continue; }
+    KEY = k;
+    try { mkdirSync(CFG_DIR, { recursive: true }); writeFileSync(CFG_FILE, JSON.stringify({ apiKey: k }, null, 2), { mode: 0o600 }); console.log(c.grn('saved') + c.dim(` → ${CFG_FILE.replace(homedir(), '~')}`)); } catch { console.log(c.yel('using for this session (could not write config)')); }
+    return;
+  }
+}
+async function ensureKey() {
+  if (KEY) return;                       // env var wins
+  try { const cfg = JSON.parse(readFileSync(CFG_FILE, 'utf8')); if (cfg.apiKey) { KEY = cfg.apiKey; return; } } catch {}
+  await setupKey();                      // nothing saved → first-run flow
 }
 
 // ── one task ──
@@ -126,9 +188,13 @@ async function runTask(task, history) {
     if (cmd.trim() === 'echo C0MPUTE_DONE') break;
     const { verb, arg, write } = label(cmd);
     console.log(`${c.grn('●')} ${c.b(verb)}${c.gry('(')}${c.gry(arg || cmd.split('\n')[0])}${c.gry(')')}`);
-    if (!isSafe(cmd) && !(await permit(verb, cmd.split('\n')[0]))) {
+    const oob = outOfBounds(cmd);
+    const ok = oob.length
+      ? await permit(verb, cmd.split('\n')[0], `⚠ this touches files OUTSIDE the project: ${oob.join(', ')}`)
+      : (isSafe(cmd) || await permit(verb, cmd.split('\n')[0]));
+    if (!ok) {
       console.log(`  ${c.gry('⎿')}  ${c.red('denied by user')}`);
-      history.push({ role: 'user', content: 'The user DENIED that command. Try another approach.' }); continue;
+      history.push({ role: 'user', content: 'The user DENIED that command (it may have reached outside the project directory). Stay inside the project and try another approach.' }); continue;
     }
     const out = sh(cmd);
     if (write && isGit) {
@@ -148,26 +214,30 @@ async function runTask(task, history) {
 
 // ── main ──
 async function main() {
-  if (!KEY) { console.error(c.red('set C0MPUTE_API_KEY (get one at c0mpute.ai)')); process.exit(1); }
+  await ensureKey();
   console.log('\n' + box([
     `${ACCENT('✻')} ${c.b('c0mpute code')}`,
     c.dim('decentralized coding agent — brain on the network, hands local'),
     '',
-    `${c.dim('model:')} ${MODEL}    ${c.dim('cwd:')} ${CWD.replace(process.env.HOME || '~', '~')}`,
+    `${c.dim('model:')} ${MODEL}    ${c.dim('cwd:')} ${CWD.replace(homedir(), '~')}`,
+    c.dim('sandbox: won\'t touch files outside this dir without asking'),
     isGit ? c.dim('git repo · diffs on') : c.dim('not a git repo · diffs off'),
   ]));
   const history = [{ role: 'system', content: SYSTEM }];
   const fin = () => { if (redactCount) console.log(c.dim(`  ${redactCount} secret${redactCount > 1 ? 's' : ''} redacted before leaving your machine`)); };
   const one = process.argv.slice(2).join(' ').trim();
-  if (one) { await runTask(one, history); fin(); return; }
+  if (one) { await runTask(one, history); fin(); RL?.close(); return; }
   while (true) {
     console.log(c.gry('╭' + '─'.repeat(W - 2) + '╮') + '\n' + c.gry('│ ') + c.b('> ') + ' '.repeat(W - 6) + c.gry('│') + '\n' + c.gry('╰' + '─'.repeat(W - 2) + '╯'));
     const task = await ask('  ');
+    if (closed) { console.log(''); fin(); break; }
     if (!task) continue;
     if (task === '/exit' || task === '/quit') { fin(); break; }
-    if (task === '/help') { console.log(c.dim('  type a coding task. commands ask approval; reads auto-run. /exit to quit.')); continue; }
+    if (task === '/login') { await setupKey(); continue; }
+    if (task === '/help') { console.log(c.dim('  type a coding task. /login set API key · /exit quit. writes ask approval, reads auto-run, files outside this dir always ask.')); continue; }
     try { await runTask(task, history); } catch (x) { console.log(c.red('  ! ' + x.message)); }
   }
+  RL?.close();
 }
 
 const SYSTEM = `You are c0mpute code, an autonomous coding agent in a local repo at ${CWD}.
