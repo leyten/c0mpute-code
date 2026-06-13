@@ -11,7 +11,8 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { createInterface } from 'readline';
 import { stdin, stdout } from 'process';
 import { homedir } from 'os';
-import { resolve, isAbsolute, join } from 'path';
+import { resolve, isAbsolute, join, dirname } from 'path';
+import { fileURLToPath } from 'url';
 
 // ── config ──
 const API_BASE = process.env.C0MPUTE_API_URL || 'https://c0mpute.ai/api/v1';
@@ -20,6 +21,7 @@ const CFG_DIR = join(homedir(), '.config', 'c0mpute-code');
 const CFG_FILE = join(CFG_DIR, 'config.json');
 let KEY = process.env.C0MPUTE_API_KEY || '';
 const MODEL = process.env.C0MPUTE_MODEL || 'code';
+let VERSION = ''; try { VERSION = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'package.json'), 'utf8')).version || ''; } catch {}
 const MAX_STEPS = Number(process.env.C0MPUTE_MAX_STEPS || 40);
 const CWD = process.cwd();
 const ROOT = CWD; // the project boundary: the agent may not touch files outside this without approval
@@ -241,10 +243,12 @@ async function main() {
     if (a !== 'y' && a !== 'yes') { console.log(c.dim('  exiting — cd into your project and run again.')); RL?.close(); return; }
   }
   console.log('\n' + box([
-    `${MARK} ${c.b('c0mpute code')}`,
-    c.dim(`${MODEL}  ·  ${CWD.replace(homedir(), '~')}  ·  ${isGit ? 'git' : 'no git'}`),
+    `${MARK} ${c.b('c0mpute code')}${VERSION ? c.gry('  v' + VERSION) : ''}`,
+    c.dim('your coding agent, running on the c0mpute network'),
+    '',
+    `${c.dim('model')}  ${MODEL}     ${c.dim('cwd')}  ${CWD.replace(homedir(), '~')}     ${c.dim(isGit ? 'git · diffs on' : 'no git')}`,
+    c.dim('edits ask first · reads run automatically · /help for more'),
   ]));
-  console.log(c.dim('  /help  ·  /login  ·  /exit'));
   const history = [{ role: 'system', content: SYSTEM }];
   const fin = () => { if (redactCount) console.log(c.dim(`  ${redactCount} secret${redactCount > 1 ? 's' : ''} redacted before leaving your machine`)); };
   const one = process.argv.slice(2).join(' ').trim();
@@ -265,11 +269,12 @@ const SYSTEM = `You are c0mpute code: an open coding agent that lives in the use
 on their projects (read, edit, run, debug). Your model runs on c0mpute's decentralized GPU network,
 so you can't be taken down, rate-limited, or censored. You are not Claude, ChatGPT, or Copilot.
 
-Identity: ONLY when explicitly asked who/what you are, answer briefly in plain text, e.g. "i'm
-c0mpute code, your coding agent. i work on your projects right here in the terminal, and i run on
-c0mpute's decentralized network." Never introduce yourself or restate this otherwise — for a coding
-task, skip the intro and get straight to work. Voice: lowercase "c0mpute", plain and direct, no
-hype, no emoji, no em dashes.
+Identity: ONLY when explicitly asked who/what you are, answer briefly, e.g. "I'm c0mpute code, your
+coding agent. I work on your projects right here in the terminal, and I run on c0mpute's
+decentralized network." Never introduce yourself or restate this otherwise; for a coding task, skip
+the intro and get straight to work. Voice: write with NORMAL capitalization and grammar like any
+assistant. The ONLY thing kept lowercase is the brand name itself, "c0mpute" / "c0mpute code". Be
+plain and direct, no hype, no emoji, no em dashes.
 
 If the user's message is a greeting, small talk, or a question that needs no file changes
 (e.g. "hey", "what are you?", "how does this work?"), just reply in plain text with NO
