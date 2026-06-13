@@ -97,7 +97,14 @@ async function think(messages) {
     const r = await fetch(API, { method: 'POST', headers: { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: MODEL, messages, temperature: 0.2, max_tokens: 1024, stream: true }) });
     if (!r.ok) throw new Error(`c0mpute API ${r.status}: ${(await r.text()).slice(0, 200)}`);
     const reader = r.body.getReader(), dec = new TextDecoder();
-    let buf = '', full = '', inCode = false, shown = false, out = '', printed = 0;
+    let buf = '', full = '', inCode = false, shown = false, prose = '', pp = 0;
+    // stream prose, stripping the model's "THOUGHT:" label — withhold a 9-char tail
+    // (len of "THOUGHT: ") so a half-arrived keyword never leaks to the screen.
+    const flush = (final) => {
+      const clean = prose.replace(/\bTHOUGHT:?\s*/gi, '');
+      const upto = final ? clean.length : Math.max(pp, clean.length - 9);
+      if (upto > pp) { process.stdout.write(clean.slice(pp, upto)); pp = upto; shown = true; }
+    };
     while (true) {
       const { done, value } = await reader.read(); if (done) break;
       buf += dec.decode(value, { stream: true }); const lines = buf.split('\n'); buf = lines.pop() || '';
@@ -108,11 +115,12 @@ async function think(messages) {
         if (!first) { first = true; stop(); }
         full += tok;
         if (!inCode) {
-          if (full.includes('```')) inCode = true;
-          else { out += tok; const clean = out.replace(/\bTHOUGHT:?\s*/gi, ''); process.stdout.write(clean.slice(printed)); printed = clean.length; shown = true; }
+          if (full.includes('```')) { inCode = true; flush(true); }
+          else { prose += tok; flush(false); }
         }
       }
     }
+    flush(true);
     if (shown) process.stdout.write('\n');
     return full;
   } finally { stop(); }
@@ -182,6 +190,7 @@ async function ensureKey() {
 async function runTask(task, history) {
   console.log('');
   history.push({ role: 'user', content: task });
+  let ran = false;
   for (let step = 1; step <= MAX_STEPS; step++) {
     const reply = await think(history.map(m => ({ ...m, content: redact(m.content) })));
     history.push({ role: 'assistant', content: reply });
@@ -198,6 +207,7 @@ async function runTask(task, history) {
       console.log(`  ${c.gry('⎿')}  ${c.red('denied by user')}`);
       history.push({ role: 'user', content: 'The user DENIED that command (it may have reached outside the project directory). Stay inside the project and try another approach.' }); continue;
     }
+    ran = true;
     const out = sh(cmd);
     if (write && isGit) {
       const { adds, dels, rows } = renderDiff(gitDiff());
@@ -211,12 +221,25 @@ async function runTask(task, history) {
     console.log('');
     history.push({ role: 'user', content: `Output:\n${redact(clip(out, 3000))}` });
   }
-  console.log(c.grn('●') + ' ' + c.dim('done') + '\n');
+  if (ran) console.log(c.grn('●') + ' ' + c.dim('done') + '\n');
+  else console.log('');
 }
 
 // ── main ──
 async function main() {
   await ensureKey();
+  // refuse to run loose in home/system dirs — there's no "project" boundary there and
+  // the agent would freely read personal files and send their contents to the network.
+  const SENSITIVE = new Set([homedir(), '/', '/root', '/home', '/etc', '/usr', '/var', '/bin', '/opt']);
+  if (SENSITIVE.has(resolve(CWD))) {
+    console.log('\n' + box([
+      `${c.red('⚠ this is not a project directory')}`,
+      c.dim(`you're in ${CWD.replace(homedir(), '~')} — the agent could read personal`),
+      c.dim('files here and send them to the network. cd into a repo first.'),
+    ]));
+    const a = (await ask(`  continue here anyway? ${c.dim('(y/N)')} `)).toLowerCase();
+    if (a !== 'y' && a !== 'yes') { console.log(c.dim('  exiting — cd into your project and run again.')); RL?.close(); return; }
+  }
   console.log('\n' + box([
     `${ACCENT('✻')} ${c.b('c0mpute code')}`,
     c.dim('decentralized coding agent — brain on the network, hands local'),
@@ -243,9 +266,17 @@ async function main() {
 }
 
 const SYSTEM = `You are c0mpute code, an autonomous coding agent in a local repo at ${CWD}.
-Each turn: a brief THOUGHT (1-2 sentences), then exactly ONE bash command in a single \`\`\`bash code block.
-The command runs in the repo; you get stdout/stderr next turn. Work in small steps: explore (ls/cat/grep),
-edit (sed -i, or cat > path <<'EOF' … EOF), and run tests to verify. Do not ask the user questions.
+
+If the user's message is a greeting, small talk, or a question that needs no file changes
+(e.g. "hey", "what can you do?", "how does this work?"), just reply in plain text with NO
+code block. Do NOT explore or read files for these — only a real coding/build/debug task
+warrants running commands. When unsure whether something is a task, ask a one-line
+clarifying question in plain text instead of poking at the filesystem.
+
+For an actual coding task: each turn output a brief THOUGHT (1-2 sentences), then exactly ONE
+bash command in a single \`\`\`bash code block. The command runs in the repo; you get
+stdout/stderr next turn. Work in small steps: explore (ls/cat/grep), edit (sed -i, or
+cat > path <<'EOF' … EOF), and run tests to verify. Do not ask the user questions mid-task.
 When the task is fully complete, output a THOUGHT then exactly:
 \`\`\`bash
 echo C0MPUTE_DONE
