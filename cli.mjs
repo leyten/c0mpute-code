@@ -32,9 +32,10 @@ const ACCENT = (s) => `\x1b[38;5;208m${s}\x1b[0m`; // c0mpute orange-ish
 const vlen = (s) => s.replace(/\x1b\[[0-9;]*m/g, '').length;
 const clip = (s, n = 4000) => { s = String(s ?? ''); return s.length > n ? s.slice(0, n) + c.dim(` … +${s.length - n} chars`) : s; };
 
-// ── rounded box ──
-const W = 70;
+// ── rounded box ── (width tracks the terminal so the right border never clips)
+const wbox = () => Math.min(72, Math.max(46, (stdout.columns || 80) - 2));
 function box(lines) {
+  const W = wbox();
   const out = [c.gry('╭' + '─'.repeat(W - 2) + '╮')];
   for (const ln of lines) out.push(c.gry('│ ') + ln + ' '.repeat(Math.max(0, W - 4 - vlen(ln))) + c.gry(' │'));
   out.push(c.gry('╰' + '─'.repeat(W - 2) + '╯'));
@@ -142,6 +143,7 @@ function rl() { if (!RL) { RL = createInterface({ input: stdin, output: stdout }
 const ask = (q) => new Promise(r => { if (closed) return r(''); rl().question(q, a => r(a.trim())); });
 async function permit(verb, detail, warn) {
   if (!warn && (allow.all || session.has(verb))) return true; // out-of-bounds always asks, even in yolo
+  const W = wbox();
   console.log('\n' + box([
     c.b(verb + ' wants to run:'), '', c.yel(detail.slice(0, W - 8)),
     ...(warn ? ['', c.red(warn.slice(0, W - 6))] : []),
