@@ -90,7 +90,7 @@ function label(cmd) {
 const WORDS = ['Brewing', 'Computing', 'Routing', 'Reasoning', 'Crunching', 'Distributing'];
 async function think(messages) {
   let i = 0, tick = null, first = false; const word = WORDS[Math.floor(messages.length) % WORDS.length];
-  if (stdout.isTTY) tick = setInterval(() => { if (!first) process.stdout.write(`\r${ACCENT('✻')} ${c.dim(word + '… (the brain is on the c0mpute network)')}   `); }, 90);
+  if (stdout.isTTY && !process.env.C0MPUTE_NO_SPINNER) tick = setInterval(() => { if (!first) process.stdout.write(`\r${ACCENT('✻')} ${c.dim(word + '… (the brain is on the c0mpute network)')}   `); }, 90);
   const stop = () => { if (tick) { clearInterval(tick); tick = null; if (stdout.isTTY) process.stdout.write('\r\x1b[K'); } };
   try {
     const r = await fetch(API, { method: 'POST', headers: { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: MODEL, messages, temperature: 0.2, max_tokens: 1024, stream: true }) });
@@ -178,7 +178,7 @@ async function ensureKey() {
 
 // ── one task ──
 async function runTask(task, history) {
-  console.log('\n' + c.b('> ') + task + '\n');
+  console.log('');
   history.push({ role: 'user', content: task });
   for (let step = 1; step <= MAX_STEPS; step++) {
     const reply = await think(history.map(m => ({ ...m, content: redact(m.content) })));
@@ -223,13 +223,13 @@ async function main() {
     c.dim('sandbox: won\'t touch files outside this dir without asking'),
     isGit ? c.dim('git repo · diffs on') : c.dim('not a git repo · diffs off'),
   ]));
+  console.log(c.dim('  ask me to build or fix something  ·  /login set key  ·  /exit quit'));
   const history = [{ role: 'system', content: SYSTEM }];
   const fin = () => { if (redactCount) console.log(c.dim(`  ${redactCount} secret${redactCount > 1 ? 's' : ''} redacted before leaving your machine`)); };
   const one = process.argv.slice(2).join(' ').trim();
-  if (one) { await runTask(one, history); fin(); RL?.close(); return; }
+  if (one) { console.log('\n' + c.gry('│ ') + c.b('› ') + one); await runTask(one, history); fin(); RL?.close(); return; }
   while (true) {
-    console.log(c.gry('╭' + '─'.repeat(W - 2) + '╮') + '\n' + c.gry('│ ') + c.b('> ') + ' '.repeat(W - 6) + c.gry('│') + '\n' + c.gry('╰' + '─'.repeat(W - 2) + '╯'));
-    const task = await ask('  ');
+    const task = await ask('\n' + c.gry('│ ') + c.b('› '));   // inline prompt — cursor sits right here
     if (closed) { console.log(''); fin(); break; }
     if (!task) continue;
     if (task === '/exit' || task === '/quit') { fin(); break; }
