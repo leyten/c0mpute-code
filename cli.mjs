@@ -83,19 +83,36 @@ When the task is fully complete, output a THOUGHT then exactly:
 echo C0MPUTE_DONE
 \`\`\``;
 
-// Non-streaming + spinner. (c0mpute's SSE streaming path currently truncates
-// responses — tracked as a separate API/worker bug; switch to stream:true here
-// once it's fixed for live token output.)
+// Live streaming over the c0mpute network: spinner until the first token, then
+// the THOUGHT streams in real time (the bash command itself is shown on its own
+// line afterwards, so we stop echoing once a code fence starts).
 const FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 async function think(messages) {
-  let i = 0, tick = null;
-  if (stdout.isTTY) tick = setInterval(() => process.stdout.write(`\r   ${c.mag(FRAMES[i++ % FRAMES.length])} ${c.dim('thinking on the c0mpute network…')}`), 80);
-  else process.stdout.write(c.dim('   thinking on the c0mpute network…\n'));
+  let i = 0, tick = null, first = false;
+  if (stdout.isTTY) tick = setInterval(() => { if (!first) process.stdout.write(`\r   ${c.mag(FRAMES[i++ % FRAMES.length])} ${c.dim('thinking on the c0mpute network…')}`); }, 80);
+  const stopSpin = () => { if (tick) { clearInterval(tick); tick = null; if (stdout.isTTY) process.stdout.write('\r\x1b[K'); } };
   try {
-    const r = await fetch(API, { method: 'POST', headers: { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: MODEL, messages, temperature: 0.2, max_tokens: 1024 }) });
+    const r = await fetch(API, { method: 'POST', headers: { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: MODEL, messages, temperature: 0.2, max_tokens: 1024, stream: true }) });
     if (!r.ok) throw new Error(`c0mpute API ${r.status}: ${(await r.text()).slice(0, 200)}`);
-    return (await r.json()).choices?.[0]?.message?.content || '';
-  } finally { if (tick) { clearInterval(tick); process.stdout.write('\r\x1b[K'); } }
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = '', full = '', inCode = false, shown = false;
+    while (true) {
+      const { done, value } = await reader.read(); if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const lines = buf.split('\n'); buf = lines.pop() || '';
+      for (const ln of lines) {
+        if (!ln.startsWith('data:')) continue;
+        const p = ln.slice(5).trim(); if (p === '[DONE]') continue;
+        let tok = ''; try { tok = JSON.parse(p).choices?.[0]?.delta?.content || ''; } catch { continue; }
+        if (!tok) continue;
+        if (!first) { first = true; stopSpin(); process.stdout.write('   '); }
+        full += tok;
+        if (!inCode) { if (full.includes('```')) inCode = true; else { process.stdout.write(c.gry(tok.replace(/\n/g, '\n   '))); shown = true; } }
+      }
+    }
+    if (shown) process.stdout.write('\n');
+    return full;
+  } finally { stopSpin(); }
 }
 
 const parseCmd = (t) => { const m = String(t || '').match(/```(?:bash|sh)?\s*\n([\s\S]*?)```/); return m ? m[1].trim() : null; };
@@ -106,9 +123,7 @@ async function runTask(task, history) {
   for (let step = 1; step <= MAX_STEPS; step++) {
     const reply = await think(history.map(m => ({ ...m, content: redact(m.content) })));
     history.push({ role: 'assistant', content: reply });
-    const thought = reply.split('```')[0].replace(/THOUGHT:?/i, '').trim();
-    if (thought) console.log('   ' + c.gry(thought.replace(/\n/g, '\n   ')));
-    const cmd = parseCmd(reply);
+    const cmd = parseCmd(reply);  // thought already streamed live by think()
     if (!cmd) { console.log(c.dim('   (no command — stopping)')); break; }
     if (cmd.trim() === 'echo C0MPUTE_DONE') { console.log(c.grn('\n   ✓ done\n')); break; }
     console.log(c.cyn('   $ ') + cmd.replace(/\n/g, '\n     '));
