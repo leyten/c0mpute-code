@@ -7,7 +7,7 @@
 //   C0MPUTE_API_KEY=sk-... c0mpute-code            # interactive
 //   C0MPUTE_API_KEY=sk-... c0mpute-code "task"     # one task, then exit
 import { execSync } from 'child_process';
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync } from 'fs';
 import { createInterface } from 'readline';
 import { stdin, stdout } from 'process';
 import { homedir } from 'os';
@@ -58,37 +58,6 @@ const redact = (t) => { let s = String(t ?? ''); for (const rx of SECRET_RX) s =
 // ── git / shell ──
 const isGit = existsSync(`${CWD}/.git`);
 const sh = (cmd) => { try { return execSync(cmd, { cwd: CWD, timeout: 120000, stdio: ['ignore', 'pipe', 'pipe'], shell: '/bin/bash' }).toString(); } catch (x) { return `exit ${x.status}\n${x.stdout?.toString() || ''}\n${x.stderr?.toString() || ''}`; } };
-const gitDiff = () => { if (!isGit) return ''; try { return execSync('git --no-pager diff', { cwd: CWD }).toString() + execSync('git --no-pager diff --cached', { cwd: CWD }).toString(); } catch { return ''; } };
-
-// render a unified diff Claude-style: line numbers + colored +/- under the action
-function renderDiff(diff) {
-  let adds = 0, dels = 0, oldn = 0, newn = 0; const rows = [];
-  for (const ln of diff.split('\n')) {
-    if (ln.startsWith('@@')) { const m = ln.match(/-([0-9]+).*\+([0-9]+)/); if (m) { oldn = +m[1]; newn = +m[2]; } continue; }
-    if (ln.startsWith('+++') || ln.startsWith('---') || ln.startsWith('diff ') || ln.startsWith('index ')) continue;
-    if (ln.startsWith('+')) { adds++; rows.push(c.gry(String(newn).padStart(5)) + ' ' + c.grn('+ ' + ln.slice(1))); newn++; }
-    else if (ln.startsWith('-')) { dels++; rows.push(c.gry(String(oldn).padStart(5)) + ' ' + c.red('- ' + ln.slice(1))); oldn++; }
-    else { rows.push(c.gry(String(newn).padStart(5)) + '   ' + c.gry(ln.slice(1))); oldn++; newn++; }
-  }
-  return { adds, dels, rows };
-}
-
-// ── command → Claude-style action label ──
-const SAFE = /^(ls|cat|head|tail|pwd|grep|rg|find|wc|echo|git (status|diff|log|show|branch)|python3? -m pytest|pytest|node --version|python3? --version)\b/;
-const isSafe = (cmd) => cmd.split(/&&|\|\||;|\|/).every(p => SAFE.test(p.trim()));
-function label(cmd) {
-  const first = cmd.trim().split('\n')[0];
-  let m;
-  if ((m = first.match(/^cat\s+(?:-\w+\s+)*([^\s|>]+)\s*$/))) return { verb: 'Read', arg: m[1], write: false };
-  // a real stdout redirect to a file — not 2>/dev/null, not &>/dev/null (fd/null discards)
-  const redir = cmd.match(/(?<![0-9&])>>?\s*([^\s&|;]+)/);
-  const redirWrite = redir && redir[1] !== '/dev/null';
-  if (/\bsed\s+-i\b/.test(cmd) || /\btee\b/.test(cmd) || redirWrite || /^cat\s*>/.test(first)) {
-    const f = (cmd.match(/\bsed\s+-i\b[^\n]*?\s([^\s&|;<>]+)\s*$/) || [])[1] || (redirWrite ? redir[1] : '') || (cmd.match(/\btee\s+([^\s&|;]+)/) || [])[1];
-    return { verb: 'Update', arg: f || '', write: true };
-  }
-  return { verb: 'Bash', arg: first, write: false };
-}
 
 // ── streaming over the network ──
 const PULSE = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█', '▇', '▆', '▅', '▄', '▃', '▂']; // compute pulse
@@ -128,7 +97,83 @@ async function think(messages) {
     return full;
   } finally { stop(); }
 }
-const parseCmd = (t) => { const m = String(t || '').match(/```(?:bash|sh)?\s*\n([\s\S]*?)```/); return m ? m[1].trim() : null; };
+// ── action protocol: model emits ONE fenced block per turn; first line is the command ──
+const VERBS = new Set(['list', 'search', 'read', 'edit', 'write', 'run', 'done']);
+function parseAction(text) {
+  const m = String(text || '').match(/```([^\n]*)\n([\s\S]*?)```/);
+  if (!m) return null;
+  const info = m[1].trim(), body = m[2];
+  let cmdline, rest;
+  if (VERBS.has(info.split(/\s+/)[0]?.toLowerCase())) { cmdline = info; rest = body.replace(/\n+$/, ''); }
+  else { const nl = body.indexOf('\n'); cmdline = (nl < 0 ? body : body.slice(0, nl)).trim(); rest = nl < 0 ? '' : body.slice(nl + 1).replace(/\n+$/, ''); }
+  const sp = cmdline.search(/\s/);
+  const verb = (sp < 0 ? cmdline : cmdline.slice(0, sp)).toLowerCase();
+  const arg = sp < 0 ? '' : cmdline.slice(sp + 1).trim();
+  return VERBS.has(verb) ? { verb, arg, body: rest } : null;
+}
+
+// ── local file tools (run on the user's machine; the network only sees what we send back) ──
+const abspath = (p) => isAbsolute(p) ? resolve(p) : resolve(ROOT, p);
+const within = (p) => { const a = abspath(p); return a === ROOT || a.startsWith(ROOT + '/'); };
+const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+function toolRead(arg) {
+  const [path, s, e] = arg.split(/\s+/);
+  const start = parseInt(s) || 0, end = parseInt(e) || 0;
+  let txt; try { txt = readFileSync(abspath(path), 'utf8'); } catch (x) { return { err: `cannot read ${path}: ${x.code || x.message}` }; }
+  const lines = txt.split('\n'), from = start || 1, to = end || lines.length;
+  const slice = lines.slice(from - 1, to);
+  return { out: slice.map((l, i) => String(from + i).padStart(5) + '  ' + l).join('\n'), lines: slice.length, total: lines.length };
+}
+function toolList(arg) {
+  const dir = arg || '.';
+  let ents; try { ents = readdirSync(abspath(dir), { withFileTypes: true }); } catch (x) { return { err: `cannot list ${dir}: ${x.code || x.message}` }; }
+  const names = ents.filter(e => !e.name.startsWith('.'))
+    .sort((a, b) => (b.isDirectory() - a.isDirectory()) || a.name.localeCompare(b.name))
+    .map(e => e.isDirectory() ? e.name + '/' : e.name);
+  return { out: names.join('\n') || '(empty)' };
+}
+function toolSearch(arg) {
+  const cmd = `(command -v rg >/dev/null && rg -n --no-heading -S --max-count 6 -- ${shq(arg)} . || grep -rnI -- ${shq(arg)} . ) 2>/dev/null | head -40`;
+  return { out: sh(cmd).trim() || '(no matches)' };
+}
+// strip a line-number gutter the model may have copied from a `read` ("   12  code")
+const degut = (s) => s.split('\n').map(l => l.replace(/^\s*\d+\s{2}/, '')).join('\n');
+// locate SEARCH in the file tolerantly (exact → de-guttered → per-line whitespace-flexible)
+function locate(txt, oldStr, newStr) {
+  const uniq = (o, n) => { const i = txt.indexOf(o); return (i >= 0 && txt.indexOf(o, i + 1) < 0) ? { txt: txt.slice(0, i) + n + txt.slice(i + o.length), line: txt.slice(0, i).split('\n').length } : null; };
+  let r = uniq(oldStr, newStr); if (r) return r;
+  const og = degut(oldStr); if (og !== oldStr) { r = uniq(og, degut(newStr)); if (r) return r; }
+  const F = txt.split('\n'), O = og.split('\n').map(l => l.replace(/\s+$/, '')), N = degut(newStr).split('\n');
+  const norm = (l) => l.replace(/\s+$/, '');
+  let at = -1, count = 0;
+  for (let i = 0; i + O.length <= F.length; i++) {
+    let ok = true; for (let j = 0; j < O.length; j++) if (norm(F[i + j]) !== O[j]) { ok = false; break; }
+    if (ok) { count++; if (at < 0) at = i; }
+  }
+  if (count === 1) return { txt: [...F.slice(0, at), ...N, ...F.slice(at + O.length)].join('\n'), line: at + 1 };
+  if (count > 1) return { dup: count };
+  return null;
+}
+function toolEdit(path, body) {
+  const m = body.match(/<{3,}\s*SEARCH\s*\n([\s\S]*?)\n={3,}\s*\n([\s\S]*?)\n>{3,}\s*REPLACE/);
+  if (!m) return { err: 'malformed edit block. use <<<<<<< SEARCH / ======= / >>>>>>> REPLACE' };
+  const oldStr = m[1], newStr = m[2];
+  let txt; try { txt = readFileSync(abspath(path), 'utf8'); } catch (x) { return { err: `cannot read ${path}: ${x.code || x.message}` }; }
+  const loc = locate(txt, oldStr, newStr);
+  if (!loc) return { err: `SEARCH text not found in ${path}. Re-read the file and copy the exact lines WITHOUT the line-number prefix.` };
+  if (loc.dup) return { err: `SEARCH matches ${loc.dup}x in ${path}. Add more surrounding context to make it unique.` };
+  writeFileSync(abspath(path), loc.txt);
+  const oldL = degut(oldStr).split('\n'), newL = degut(newStr).split('\n'), rows = [];
+  oldL.forEach((l, i) => rows.push(c.gry(String(loc.line + i).padStart(5)) + ' ' + c.red('- ' + l)));
+  newL.forEach((l, i) => rows.push(c.gry(String(loc.line + i).padStart(5)) + ' ' + c.grn('+ ' + l)));
+  return { out: `Updated ${path} (+${newL.length} -${oldL.length})`, rows };
+}
+function toolWrite(path, body) {
+  const existed = existsSync(abspath(path));
+  try { mkdirSync(dirname(abspath(path)), { recursive: true }); writeFileSync(abspath(path), body.endsWith('\n') ? body : body + '\n'); }
+  catch (x) { return { err: `cannot write ${path}: ${x.code || x.message}` }; }
+  return { out: `${existed ? 'Overwrote' : 'Created'} ${path} (${body.split('\n').length} lines)` };
+}
 
 // ── filesystem boundary ──
 // Return any path tokens in the command that resolve OUTSIDE the project root.
@@ -189,6 +234,8 @@ async function ensureKey() {
 }
 
 // ── one task ──
+const READONLY = new Set(['read', 'list', 'search']);
+const LABELS = { read: 'Read', list: 'List', search: 'Search', edit: 'Update', write: 'Write', run: 'Run' };
 async function runTask(task, history) {
   console.log('');
   history.push({ role: 'user', content: task });
@@ -196,32 +243,36 @@ async function runTask(task, history) {
   for (let step = 1; step <= MAX_STEPS; step++) {
     const reply = await think(history.map(m => ({ ...m, content: redact(m.content) })));
     history.push({ role: 'assistant', content: reply });
-    const cmd = parseCmd(reply);
-    if (!cmd) break;
-    if (cmd.trim() === 'echo C0MPUTE_DONE') break;
-    const { verb, arg, write } = label(cmd);
-    console.log(`${MARK} ${c.b(verb)}${c.gry('(')}${c.gry(arg || cmd.split('\n')[0])}${c.gry(')')}`);
-    const oob = outOfBounds(cmd);
-    const ok = oob.length
-      ? await permit(verb, cmd.split('\n')[0], `⚠ this touches files OUTSIDE the project: ${oob.join(', ')}`)
-      : (isSafe(cmd) || await permit(verb, cmd.split('\n')[0]));
-    if (!ok) {
-      console.log(`  ${c.gry('⎿')}  ${c.red('denied by user')}`);
-      history.push({ role: 'user', content: 'The user DENIED that command (it may have reached outside the project directory). Stay inside the project and try another approach.' }); continue;
-    }
-    ran = true;
-    const out = sh(cmd);
-    if (write && isGit) {
-      const { adds, dels, rows } = renderDiff(gitDiff());
-      console.log(`  ${c.gry('⎿')}  ${c.dim(`Updated ${arg} with ${adds} addition${adds !== 1 ? 's' : ''} and ${dels} removal${dels !== 1 ? 's' : ''}`)}`);
-      for (const row of rows.slice(0, 30)) console.log('     ' + row);
-    } else {
-      const lines = clip(out, 500).split('\n').filter(x => x.length);
-      console.log(`  ${c.gry('⎿')}  ${c.dim(lines[0] || '(no output)')}`);
-      for (const l of lines.slice(1, 8)) console.log('     ' + c.dim(l));
-    }
+    const act = parseAction(reply);
+    if (!act) break;                        // no action -> done / just talking
+    const { verb, arg } = act;
+    if (verb === 'done') { ran = true; break; }
+    const path0 = arg.split(/\s+/)[0] || '';
+    const shown = verb === 'search' ? arg : (verb === 'run' ? (arg || act.body.split('\n')[0]) : path0);
+    console.log(`${MARK} ${c.b(LABELS[verb])}${c.gry('(')}${c.gry(shown)}${c.gry(')')}`);
+
+    // permission: reads auto-run; edits/writes/run + anything out-of-bounds ask
+    const oob = verb === 'run' ? outOfBounds(arg || act.body) : (within(path0) ? [] : [path0]);
+    let ok = true;
+    if (oob.length) ok = await permit(LABELS[verb], shown, `⚠ this touches files OUTSIDE the project: ${oob.join(', ')}`);
+    else if (!READONLY.has(verb)) ok = await permit(LABELS[verb], shown);
+    if (!ok) { console.log(`  ${c.gry('⎿')}  ${c.red('denied by user')}`); history.push({ role: 'user', content: `The user denied ${verb} on ${shown}. Try another approach inside the project.` }); continue; }
+
+    // execute the tool locally
+    let res, obs;
+    if (verb === 'read') { res = toolRead(arg); obs = res.err || `${path0} (${res.lines}/${res.total} lines):\n${res.out}`; }
+    else if (verb === 'list') { res = toolList(arg); obs = res.err || `${arg || '.'}:\n${res.out}`; }
+    else if (verb === 'search') { res = toolSearch(arg); obs = res.err || `matches for "${arg}":\n${res.out}`; }
+    else if (verb === 'edit') { res = toolEdit(path0, act.body); obs = res.err || res.out; if (!res.err) ran = true; }
+    else if (verb === 'write') { res = toolWrite(path0, act.body); obs = res.err || res.out; if (!res.err) ran = true; }
+    else { const cmd = arg || act.body; const out = sh(cmd); res = { out }; obs = `$ ${cmd}\n${clip(out, 3000)}`; ran = true; }
+
+    // render result under the action
+    if (res.err) console.log(`  ${c.gry('⎿')}  ${c.red(res.err.split('\n')[0])}`);
+    else if (res.rows) { console.log(`  ${c.gry('⎿')}  ${c.dim(res.out)}`); for (const row of res.rows.slice(0, 30)) console.log('     ' + row); }
+    else { const lines = clip(res.out, 600).split('\n'); console.log(`  ${c.gry('⎿')}  ${c.dim(lines[0] || '(empty)')}`); for (const l of lines.slice(1, 8)) console.log('     ' + c.dim(l)); }
     console.log('');
-    history.push({ role: 'user', content: `Output:\n${redact(clip(out, 3000))}` });
+    history.push({ role: 'user', content: redact(clip(obs, 4000)) });
   }
   if (ran) console.log(MARK + ' ' + c.dim('done') + '\n');
   else console.log('');
@@ -259,7 +310,7 @@ async function main() {
     if (!task) continue;
     if (task === '/exit' || task === '/quit') { fin(); break; }
     if (task === '/login') { await setupKey(); continue; }
-    if (task === '/help') { console.log(c.dim('  type a coding task. /login set API key · /exit quit. writes ask approval, reads auto-run, files outside this dir always ask.')); continue; }
+    if (task === '/help') { console.log(c.dim('  describe a coding task; I locate, read, edit, and run tests to verify.\n  reads auto-run · edits/commands ask first · files outside this dir always ask.\n  /login set key · /exit quit')); continue; }
     try { await runTask(task, history); } catch (x) { console.log(c.red('  ! ' + x.message)); }
   }
   RL?.close();
@@ -282,13 +333,61 @@ code block. Do NOT explore or read files for these — only a real coding/build/
 warrants running commands. When unsure whether something is a task, ask a one-line
 clarifying question in plain text instead of poking at the filesystem.
 
-For an actual coding task: each turn output a brief THOUGHT (1-2 sentences), then exactly ONE
-bash command in a single \`\`\`bash code block. The command runs in the repo; you get
-stdout/stderr next turn. Work in small steps: explore (ls/cat/grep), edit (sed -i, or
-cat > path <<'EOF' … EOF), and run tests to verify. Do not ask the user questions mid-task.
-When the task is fully complete, output a THOUGHT then exactly:
-\`\`\`bash
-echo C0MPUTE_DONE
-\`\`\``;
+WORKING ON A TASK — begin immediately. Do NOT greet, introduce yourself, or restate your identity;
+just start working. You act as an agent in a loop. Each turn: write ONE short sentence on what
+you're doing next, then emit EXACTLY ONE action as a fenced code block. The first line inside the
+block is the command. You get the result next turn, then continue. One action per turn only.
+
+Actions (the first line is literally the command):
+
+\`\`\`
+list src
+\`\`\`
+List files in a directory (default: the repo root).
+
+\`\`\`
+search <regex>
+\`\`\`
+Search file contents across the repo. Use this to locate code before reading.
+
+\`\`\`
+read path/to/file.py 20 60
+\`\`\`
+Read a file. The two numbers (optional) are a start/end line range.
+
+\`\`\`
+edit path/to/file.py
+<<<<<<< SEARCH
+the exact existing text to replace
+=======
+the new text
+>>>>>>> REPLACE
+\`\`\`
+Replace an exact, unique snippet. The SEARCH text must match the file's lines including indentation.
+Copy it from a read, but do NOT include the line-number prefix — only the code itself. Keep edits
+small and surgical.
+
+\`\`\`
+write path/to/new_file.py
+<full file contents>
+\`\`\`
+Create a new file or fully overwrite one. Prefer edit for existing files.
+
+\`\`\`
+run python3 -m pytest -q
+\`\`\`
+Run a shell command (tests, build, repro).
+
+\`\`\`
+done
+one line on what you changed
+\`\`\`
+Finish — ONLY after you verified the fix (ran the test/repro and it passed).
+
+Discipline (this is what makes you good):
+- First locate the relevant code with list/search, then READ a file before you edit it.
+- Make the SMALLEST change that solves the task. Never edit or reformat unrelated code.
+- After an edit, run the test or repro. If it fails, read the error and iterate.
+- Finish with \`done\` as soon as it's verified. Do not keep poking once it works.`;
 
 main();

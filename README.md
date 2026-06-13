@@ -17,9 +17,12 @@ and saves it to `~/.config/c0mpute-code/config.json`. Re-set it anytime with `/l
 You can also pass it via the `C0MPUTE_API_KEY` env var.
 
 ## What it does
-- Explores your repo, edits files, and runs commands/tests in a loop until the task is done.
-- **Asks before every edit or command** (allow once / always / deny). Read-only commands
-  (ls, cat, grep, git status…) run automatically.
+- Works as an agent loop with real tools: **list, search, read, edit, write, run**. It locates
+  the relevant code, reads it, makes a surgical edit, runs your tests, and stops when they pass.
+- Edits are **SEARCH/REPLACE** snippets (small, targeted) — not whole-file rewrites — with a
+  tolerant matcher so it doesn't fight whitespace.
+- **Asks before every edit or command** (allow once / always / deny). Reads (list/search/read)
+  run automatically.
 - **Shows colored diffs** of every change.
 - **Stays inside the project.** The directory you launch it in is the sandbox — any command
   that touches a file outside it has to be approved explicitly (even with `--yolo`).
