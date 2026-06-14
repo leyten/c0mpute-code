@@ -72,8 +72,25 @@ const SECRET_RX = [
   // .env-style UPPER_SNAKE secret keys (STRIPE_KEY=, DATABASE_URL=, JWT_SECRET=…): value redacted, key kept
   /(?<=^\s*(?:export\s+)?[A-Z][A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|PASS|PWD|CREDENTIALS?|PRIVATE|URL|URI|DSN)[A-Z0-9_]*\s*=\s*)["']?[^\s"'#]{4,}/gm,
 ];
-let redactCount = 0, redactN = 0;
-const redact = (t) => { let s = String(t ?? ''); for (const rx of SECRET_RX) s = s.replace(rx, () => { redactCount++; return `‹REDACTED-${++redactN}›`; }); return s; };
+// Reversible secret vault. Detected secrets are swapped for ‹secret:N› placeholders
+// before anything leaves the machine (the model only ever sees placeholders). On LOCAL
+// file writes the placeholders are swapped back to the real values via restore(), so a
+// pasted key lands in the project's .env on disk and the app works — same UX as any
+// coding agent, but the secret itself never went to a worker. Same value reuses one token.
+let redactCount = 0, vaultN = 0;
+const vault = new Map();        // token -> real secret
+const vaultRev = new Map();     // real secret -> token
+const SECRET_TOKEN_RX = /‹secret:\d+›/g;
+const redact = (t) => {
+  let s = String(t ?? '');
+  for (const rx of SECRET_RX) s = s.replace(rx, (m) => {
+    if (vaultRev.has(m)) return vaultRev.get(m);
+    const tok = `‹secret:${++vaultN}›`; vault.set(tok, m); vaultRev.set(m, tok); redactCount++; return tok;
+  });
+  return s;
+};
+// Swap placeholders back to real secrets — ONLY ever called for local disk writes.
+const restore = (t) => String(t ?? '').replace(SECRET_TOKEN_RX, (tok) => vault.has(tok) ? vault.get(tok) : tok);
 
 // ── git / shell ──
 const isGit = existsSync(`${CWD}/.git`);
@@ -258,7 +275,9 @@ function syntaxError(path) {
 }
 // write newContent; if it breaks syntax, restore prior (or delete a new file) and report
 function commit(path, newContent, prior, okMsg, rows) {
-  writeFileSync(abspath(path), newContent);
+  // restore() turns any ‹secret:N› placeholders back into the real secret values, but
+  // ONLY here, writing to the user's local disk — so a pasted key ends up real in .env.
+  writeFileSync(abspath(path), restore(newContent));
   const bad = syntaxError(path);
   if (bad) { if (prior === null) { try { sh(`rm -f ${shq(abspath(path))}`); } catch {} } else writeFileSync(abspath(path), prior); return { err: `that change broke ${path}: ${bad.slice(0, 120)} — reverted. Re-read and fix the indentation/range.` }; }
   return { out: okMsg, rows };
@@ -476,7 +495,7 @@ async function main() {
     + (notes ? `\n\nPROJECT NOTES (from ${notes.name}, treat as authoritative project context):\n${notes.text}` : '')
     + (ws ? `\n\nRECENT WORK (your journal from past sessions in this project, oldest first — for continuity; don't redo finished work):\n${ws}` : '');
   const history = [{ role: 'system', content: sysmsg }];
-  const fin = () => { if (redactCount) console.log(c.dim(`  ${redactCount} secret${redactCount > 1 ? 's' : ''} redacted before leaving your machine`)); };
+  const fin = () => { if (redactCount) console.log(c.dim(`  ${redactCount} secret${redactCount > 1 ? 's' : ''} kept on your machine — sent as placeholders, written into .env locally`)); };
   // ctrl-c: interrupt a running task; at an idle prompt, exit cleanly
   const onSig = () => { if (busy) { interrupted = true; try { currentAbort?.abort(); } catch {} process.stdout.write('\n' + c.dim('  ^C stopping…') + '\n'); } else { console.log(); fin(); try { RL?.close(); } catch {} process.exit(0); } };
   process.on('SIGINT', onSig); rl().on('SIGINT', onSig);
@@ -590,6 +609,16 @@ Discipline (this is what makes you good):
 - Finish with \`done\` as soon as it's verified. Do not keep poking once it works.
 - NEVER claim you did something unless you actually emitted the action that did it. No
   action = nothing happened. To delete/move/change files, emit a real \`run\` or \`edit\`/
-  \`write\` action — never just say it's done.`;
+  \`write\` action — never just say it's done.
+
+Secrets: API keys, tokens, and passwords the user gives you (or that already exist in a
+file) reach you as \`‹secret:N›\` placeholders — the real value stays on the user's machine
+and you never see it. Treat a placeholder exactly as if it were the value:
+- Put it in the project's \`.env\` with a clear UPPER_SNAKE name, e.g. \`SOLANA_TRACKER_API_KEY=‹secret:1›\`,
+  and reference it in code via the env var (process.env.SOLANA_TRACKER_API_KEY, os.getenv(...)).
+- When you write a placeholder into a file it becomes the real secret on the user's disk
+  automatically. So just wire it up — do NOT ask the user to paste it again or to edit
+  .env themselves; that's your job and it already works.
+- Keep secrets ONLY in .env, and make sure .env is gitignored (create/append .gitignore).`;
 
 main();
