@@ -20,7 +20,10 @@ const API = API_BASE + '/chat/completions';
 const CFG_DIR = join(homedir(), '.config', 'c0mpute-code');
 const CFG_FILE = join(CFG_DIR, 'config.json');
 let KEY = process.env.C0MPUTE_API_KEY || '';
-const MODEL = process.env.C0MPUTE_MODEL || 'code';
+// Default to the abliterated (uncensored) model: it never moralizes, has far more
+// workers online than devstral, and matched devstral on the coding tests. Set
+// C0MPUTE_MODEL=code to use devstral instead.
+const MODEL = process.env.C0MPUTE_MODEL || 'c0mpute-max';
 let VERSION = ''; try { VERSION = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'package.json'), 'utf8')).version || ''; } catch {}
 const MAX_STEPS = Number(process.env.C0MPUTE_MAX_STEPS || 40);
 const CWD = process.cwd();
