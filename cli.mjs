@@ -65,7 +65,12 @@ const SECRET_RX = [
   /\bsk-[A-Za-z0-9_-]{16,}\b/g, /\bAKIA[0-9A-Z]{16}\b/g, /\bghp_[A-Za-z0-9]{30,}\b/g, /\bgho_[A-Za-z0-9]{30,}\b/g,
   /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g, /\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g,
   /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/g,
-  /(?<=(?:secret|token|password|passwd|api[_-]?key|access[_-]?key)["']?\s*[:=]\s*["']?)[A-Za-z0-9_\-./+=]{12,}/gi,
+  // email addresses
+  /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g,
+  // secret-like assignments (key kept, value redacted): secret/token/password/api_key/... = VALUE
+  /(?<=\b(?:secret|token|password|passwd|pwd|api[_-]?key|access[_-]?key|client[_-]?secret|private[_-]?key|auth[_-]?token|credential|bearer)["']?\s*[:=]\s*["']?)[^\s"']{8,}/gi,
+  // .env-style UPPER_SNAKE secret keys (STRIPE_KEY=, DATABASE_URL=, JWT_SECRET=…): value redacted, key kept
+  /(?<=^\s*(?:export\s+)?[A-Z][A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|PASS|PWD|CREDENTIALS?|PRIVATE|URL|URI|DSN)[A-Z0-9_]*\s*=\s*)["']?[^\s"'#]{4,}/gm,
 ];
 let redactCount = 0, redactN = 0;
 const redact = (t) => { let s = String(t ?? ''); for (const rx of SECRET_RX) s = s.replace(rx, () => { redactCount++; return `‹REDACTED-${++redactN}›`; }); return s; };
