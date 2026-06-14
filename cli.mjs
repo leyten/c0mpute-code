@@ -26,6 +26,9 @@ const MAX_STEPS = Number(process.env.C0MPUTE_MAX_STEPS || 40);
 const CWD = process.cwd();
 const ROOT = CWD; // the project boundary: the agent may not touch files outside this without approval
 const AUTO = process.env.C0MPUTE_YOLO === '1';
+// ── workspace: a persistent per-project .c0mpute/ dir the agent keeps across sessions ──
+const WS_DIR = join(ROOT, '.c0mpute');
+const WS_JOURNAL = join(WS_DIR, 'journal.md');
 
 // ── ansi ──
 const e = (n) => (s) => `\x1b[${n}m${s}\x1b[0m`;
@@ -87,6 +90,29 @@ function loadProjectNotes() {
     try { const t = readFileSync(join(ROOT, f), 'utf8').trim(); if (t) return { name: f, text: t.slice(0, 4000) }; } catch {}
   }
   return null;
+}
+
+// ── workspace memory: continuity across sessions ──
+// A running journal of completed tasks in .c0mpute/journal.md. Loaded into context at
+// startup so the agent remembers what it already did in this project; appended after
+// every verified coding task. Per-project, plain markdown, no deps. The user can commit
+// it to share project history with the team, or .gitignore it to keep it local.
+function loadWorkspace() {
+  try {
+    const lines = readFileSync(WS_JOURNAL, 'utf8').split('\n').filter(l => l.trimStart().startsWith('- '));
+    return lines.length ? lines.slice(-15).join('\n') : null;
+  } catch { return null; }
+}
+function recordWork(task, summary) {
+  try {
+    const day = new Date().toISOString().slice(0, 10);
+    const note = String(summary || task).replace(/\s+/g, ' ').trim().slice(0, 160);
+    if (!note) return;
+    mkdirSync(WS_DIR, { recursive: true });
+    let prior = ''; try { prior = readFileSync(WS_JOURNAL, 'utf8'); } catch {}
+    if (!prior) prior = '# c0mpute workspace — work journal\n# Persistent across sessions; the agent reads recent entries for continuity.\n\n';
+    writeFileSync(WS_JOURNAL, prior + `- ${day} ${note}\n`);
+  } catch {}
 }
 
 // ── streaming over the network ──
@@ -292,7 +318,7 @@ const LABELS = { read: 'Read', list: 'List', search: 'Search', edit: 'Update', w
 async function runTask(task, history) {
   console.log('');
   history.push({ role: 'user', content: task });
-  let ran = false, nudges = 0, lastRunFailed = false, doneNudges = 0;
+  let ran = false, nudges = 0, lastRunFailed = false, doneNudges = 0, doneSummary = '';
   busy = true; interrupted = false;
   // is this a coding task (enforce actions) or chat/greeting (a prose reply is fine)?
   const isCoding = /\b(fix|bug|error|fail|implement|add|refactor|test|debug|rename|update|create|build|install|broken|crash|exception|traceback|function|class|import|run)\b/i.test(task) || /[\w./-]+\.\w{1,5}\b/.test(task);
@@ -315,7 +341,7 @@ async function runTask(task, history) {
     if (verb === 'done') {
       // don't accept "done" while the last command was still failing — that's a false finish
       if (lastRunFailed && doneNudges < 2) { doneNudges++; history.push({ role: 'user', content: 'The last command reported failures/errors, so the task is NOT verified. Keep fixing and re-run the test until it passes. If you are genuinely stuck, say plainly what is still broken instead of using `done`.' }); continue; }
-      ran = true; break;
+      ran = true; doneSummary = act.body.split('\n').map(s => s.trim()).filter(Boolean)[0] || ''; break;
     }
     const path0 = arg.split(/\s+/)[0] || '';
     const shown = verb === 'search' ? arg : (verb === 'run' ? (arg || act.body.split('\n')[0]) : path0);
@@ -347,7 +373,7 @@ async function runTask(task, history) {
   }
   } finally { busy = false; }
   if (interrupted) { interrupted = false; console.log(c.dim('  ⊘ stopped.') + '\n'); }
-  else if (ran) console.log(MARK + ' ' + c.dim('done') + '\n');
+  else if (ran) { if (isCoding) recordWork(task, doneSummary); console.log(MARK + ' ' + c.dim('done') + '\n'); }
   else console.log('');
 }
 
@@ -392,14 +418,17 @@ async function main() {
     if (a !== 'y' && a !== 'yes') { console.log(c.dim('  exiting — cd into your project and run again.')); RL?.close(); return; }
   }
   const notes = loadProjectNotes();
+  const ws = loadWorkspace();
   console.log('\n' + box([
     `${MARK} ${c.b('c0mpute code')}${VERSION ? c.gry('  v' + VERSION) : ''}`,
     c.dim('your coding agent, running on the c0mpute network'),
     '',
     `${c.dim('model')}  ${MODEL}     ${c.dim('cwd')}  ${CWD.replace(homedir(), '~')}     ${c.dim(isGit ? 'git · diffs on' : 'no git')}`,
-    c.dim(`edits ask first · reads run automatically${notes ? ` · memory ${notes.name}` : ''} · /help`),
+    c.dim(`edits ask first · reads run automatically${notes ? ` · memory ${notes.name}` : ''}${ws ? ' · workspace' : ''} · /help`),
   ]));
-  const sysmsg = SYSTEM + (notes ? `\n\nPROJECT NOTES (from ${notes.name}, treat as authoritative project context):\n${notes.text}` : '');
+  const sysmsg = SYSTEM
+    + (notes ? `\n\nPROJECT NOTES (from ${notes.name}, treat as authoritative project context):\n${notes.text}` : '')
+    + (ws ? `\n\nRECENT WORK (your journal from past sessions in this project, oldest first — for continuity; don't redo finished work):\n${ws}` : '');
   const history = [{ role: 'system', content: sysmsg }];
   const fin = () => { if (redactCount) console.log(c.dim(`  ${redactCount} secret${redactCount > 1 ? 's' : ''} redacted before leaving your machine`)); };
   // ctrl-c: interrupt a running task; at an idle prompt, exit cleanly
@@ -414,7 +443,8 @@ async function main() {
     if (task === '/exit' || task === '/quit') { fin(); break; }
     if (task === '/login') { await setupKey(); continue; }
     if (task === '/init') { await initProject(); continue; }
-    if (task === '/help') { console.log(c.dim('  describe a coding task; I locate, read, edit, and run tests to verify.\n  reads auto-run · edits/commands ask first · files outside this dir always ask.\n  /init write project memory · /login set key · /exit quit · ctrl-c interrupt')); continue; }
+    if (task === '/workspace') { const j = loadWorkspace(); console.log(j ? '\n' + MARK + ' ' + c.dim(`workspace journal (${WS_JOURNAL.replace(homedir(), '~')}):`) + '\n' + j.split('\n').map(l => '  ' + c.dim(l)).join('\n') : c.dim('  no workspace yet — it starts after your first completed task.')); continue; }
+    if (task === '/help') { console.log(c.dim('  describe a coding task; I locate, read, edit, and run tests to verify.\n  reads auto-run · edits/commands ask first · files outside this dir always ask.\n  /init write project memory · /workspace show project journal · /login set key · /exit quit · ctrl-c interrupt')); continue; }
     try { await runTask(task, history); } catch (x) { console.log(c.red('  ! ' + x.message)); }
   }
   RL?.close();
