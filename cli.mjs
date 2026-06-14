@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // c0mpute code — decentralized coding agent.
-// The brain runs on the c0mpute network (the "code" model, Devstral); file edits
+// The brain runs on the c0mpute network (an uncensored model on the max tier); file edits
 // and commands run locally on your machine, under your approval. No single company
 // can take it down, rate-limit it, or censor it.
 //
