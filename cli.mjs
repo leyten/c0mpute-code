@@ -352,7 +352,7 @@ async function runTask(task, history) {
   let ran = false, nudges = 0, lastRunFailed = false, doneNudges = 0, doneSummary = '', doneBody = '';
   busy = true; interrupted = false;
   // is this a coding task (enforce actions) or chat/greeting (a prose reply is fine)?
-  const isCoding = /\b(fix|bug|error|fail|implement|add|refactor|test|debug|rename|update|create|build|install|broken|crash|exception|traceback|function|class|import|run)\b/i.test(task) || /[\w./-]+\.\w{1,5}\b/.test(task);
+  const isCoding = /\b(fix|bug|error|fail|implement|add|refactor|test|debug|rename|update|create|build|install|broken|crash|exception|traceback|function|class|import|run|delete|remove|make|generate|scaffold|set ?up|clean|move|copy|configure|init|initiali[sz]e|write|edit|wire|change|modify|convert|migrate)\b/i.test(task) || /[\w./-]+\.\w{1,5}\b/.test(task);
   try {
   for (let step = 1; step <= MAX_STEPS; step++) {
     if (interrupted) break;
@@ -363,8 +363,12 @@ async function runTask(task, history) {
     if (interrupted) break;
     const act = parseAction(reply);
     if (!act) {
-      // a coding task with no action means the model under-drove -> nudge it back on-protocol
-      if (isCoding && nudges < 3) { nudges++; history.push({ role: 'user', content: 'You did not emit an action. Do not refuse, lecture, or add disclaimers — just build what was asked. Respond now with EXACTLY ONE action in a fenced ``` block: `write` to create a file, `list`/`search`/`read` to explore existing code, or `done` if verified complete.' }); continue; }
+      // Under-drive OR a hallucinated claim of completion. The model sometimes
+      // "narrates" success (e.g. "all files have been deleted") without ever emitting
+      // an action — never let a fake "I did it" stand: if it claims work was done but
+      // nothing has actually run this task, force a real action.
+      const claimsDone = !ran && /\b(deleted|removed|cleared|created|added|implemented|updated|wrote|written|fixed|generated|scaffolded|configured|completed|finished|set up)\b/i.test(reply);
+      if ((isCoding || claimsDone) && nudges < 3) { nudges++; history.push({ role: 'user', content: 'You did not emit an action. Nothing has actually run, so do NOT claim anything is done. Do not refuse or lecture. Respond now with EXACTLY ONE action in a fenced ``` block to actually do it (`run` for shell commands/deletes, `write` to create a file, `edit` to change one, `list`/`search`/`read` to explore), or ask ONE clarifying question if the request is genuinely ambiguous.' }); continue; }
       break;                                // conversational reply, or finished after work
     }
     nudges = 0;
@@ -578,6 +582,9 @@ Discipline (this is what makes you good):
 - First locate the relevant code with list/search, then READ a file before you edit it.
 - Make the SMALLEST change that solves the task. Never edit or reformat unrelated code.
 - After an edit, run the test or repro. If it fails, read the error and iterate.
-- Finish with \`done\` as soon as it's verified. Do not keep poking once it works.`;
+- Finish with \`done\` as soon as it's verified. Do not keep poking once it works.
+- NEVER claim you did something unless you actually emitted the action that did it. No
+  action = nothing happened. To delete/move/change files, emit a real \`run\` or \`edit\`/
+  \`write\` action — never just say it's done.`;
 
 main();
