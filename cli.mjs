@@ -7,10 +7,10 @@
 //   C0MPUTE_API_KEY=sk-... c0mpute-code            # interactive
 //   C0MPUTE_API_KEY=sk-... c0mpute-code "task"     # one task, then exit
 import { spawnSync } from 'child_process';
-import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, unlinkSync } from 'fs';
 import { createInterface } from 'readline';
 import { stdin, stdout } from 'process';
-import { homedir } from 'os';
+import { homedir, tmpdir } from 'os';
 import { resolve, isAbsolute, join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -35,7 +35,16 @@ const WS_JOURNAL = join(WS_DIR, 'journal.md');
 
 // ── ansi ──
 const e = (n) => (s) => `\x1b[${n}m${s}\x1b[0m`;
-const c = { dim: e(2), bold: e(1), red: e(31), grn: e(32), yel: e(33), blu: e(34), cyn: e(36), mag: e(35), gry: e(90), b: (s) => `\x1b[1m${s}\x1b[0m` };
+const c = { dim: e(2), bold: e(1), red: e(31), grn: e(32), yel: e(33), blu: e(34), cyn: e(36), mag: e(35), gry: e(90), it: e(3), b: (s) => `\x1b[1m${s}\x1b[0m` };
+// Render a single line of the model's markdown prose to ANSI: headers, bullets,
+// bold, italic, inline code. Applied per completed line (we buffer prose by line).
+const mdLine = (s) => s
+  .replace(/^(\s*)#{1,6}\s+(.*)$/, (_, sp, t) => sp + c.b(t))            // # headers → bold
+  .replace(/^(\s*)([-*+])\s+/, (_, sp) => sp + c.grn('•') + ' ')        // - bullets → •
+  .replace(/^(\s*)(\d+)\.\s+/, (_, sp, n) => sp + c.gry(n + '.') + ' ') // 1. numbered
+  .replace(/\*\*([^*]+)\*\*/g, (_, t) => c.b(t))                        // **bold**
+  .replace(/`([^`]+)`/g, (_, t) => c.cyn(t))                            // `code`
+  .replace(/(^|[\s(])[*_]([^*_\s][^*_]*?)[*_]([\s).,!?]|$)/g, (_, a, t, z) => a + c.it(t) + z); // *italic*
 // c0mpute brand: pure black, green accent (#5af78e), pixel square marker (not Claude's round/orange dot).
 const MARK = c.grn('▪');
 const vlen = (s) => s.replace(/\x1b\[[0-9;]*m/g, '').length;
@@ -64,9 +73,17 @@ const redact = (t) => { let s = String(t ?? ''); for (const rx of SECRET_RX) s =
 // ── git / shell ──
 const isGit = existsSync(`${CWD}/.git`);
 const sh = (cmd) => {
-  const r = spawnSync('/bin/bash', ['-c', cmd], { cwd: CWD, timeout: 120000, maxBuffer: 1 << 24 });
-  if (r.error) return `error: ${r.error.code === 'ETIMEDOUT' ? 'timed out after 120s' : r.error.message}`;
-  const out = (r.stdout?.toString() || '') + (r.stderr?.toString() || '');   // tools like pytest write to stderr
+  // Redirect the whole command's output to a temp file rather than capturing via a
+  // pipe. A backgrounded child (a server: `npm start & …`) inherits the pipe and
+  // holds it open, so a pipe-capturing spawnSync hangs until the 120s timeout even
+  // though the foreground finished. With a file, the bash process exits promptly,
+  // the server keeps running (orphaned, still serving), and we read what it printed.
+  const log = join(tmpdir(), `cc-${process.pid}-${Date.now()}.log`);
+  const r = spawnSync('/bin/bash', ['-c', `( ${cmd} ) >${shq(log)} 2>&1`], { cwd: CWD, timeout: 120000 });
+  let out = ''; try { out = readFileSync(log, 'utf8'); } catch {}
+  try { unlinkSync(log); } catch {}
+  if (out.length > (1 << 24)) out = out.slice(0, 1 << 24);
+  if (r.error) return `error: ${r.error.code === 'ETIMEDOUT' ? 'timed out after 120s' : r.error.message}` + (out ? `\n${out}` : '');
   return (r.status ? `exit ${r.status}\n` : '') + out;
 };
 
@@ -121,21 +138,30 @@ function recordWork(task, summary) {
 // ── streaming over the network ──
 const PULSE = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█', '▇', '▆', '▅', '▄', '▃', '▂']; // compute pulse
 async function think(messages) {
-  let i = 0, tick = null, first = false;
-  if (stdout.isTTY && !process.env.C0MPUTE_NO_SPINNER) tick = setInterval(() => { if (!first) process.stdout.write('\r' + c.grn(PULSE[i++ % PULSE.length]) + ' '); }, 80);
-  const stop = () => { if (tick) { clearInterval(tick); tick = null; if (stdout.isTTY) process.stdout.write('\r\x1b[K'); } };
+  let i = 0, tick = null;
+  // The indicator stays alive whenever we're waiting (before the first prose line,
+  // between lines, and through the whole action-block generation) so there's never
+  // dead air — only paused while a prose line is actually being written.
+  const spin = () => { if (stdout.isTTY && !process.env.C0MPUTE_NO_SPINNER && !tick) tick = setInterval(() => process.stdout.write('\r' + c.grn(PULSE[i++ % PULSE.length]) + ' '), 80); };
+  const unspin = () => { if (tick) { clearInterval(tick); tick = null; if (stdout.isTTY) process.stdout.write('\r\x1b[K'); } };
+  spin();
   currentAbort = new AbortController();
   try {
     const r = await fetch(API, { method: 'POST', signal: currentAbort.signal, headers: { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: MODEL, messages, temperature: 0.2, max_tokens: 1024, stream: true }) });
     if (!r.ok) throw new Error(`c0mpute API ${r.status}: ${(await r.text()).slice(0, 200)}`);
     const reader = r.body.getReader(), dec = new TextDecoder();
     let buf = '', full = '', inCode = false, shown = false, prose = '', pp = 0;
-    // stream prose, stripping the model's "THOUGHT:" label — withhold a 9-char tail
-    // (len of "THOUGHT: ") so a half-arrived keyword never leaks to the screen.
+    // Emit prose a COMPLETE LINE at a time, rendered as markdown (bold/code/headers/
+    // bullets). Strip the model's "THOUGHT:" label; withhold a 9-char tail on the
+    // non-final pass so a half-arrived keyword never leaks to the screen.
     const flush = (final) => {
       const clean = prose.replace(/\bTHOUGHT:?\s*/gi, '');
-      const upto = final ? clean.length : Math.max(pp, clean.length - 9);
-      if (upto > pp) { process.stdout.write(clean.slice(pp, upto)); pp = upto; shown = true; }
+      const safeEnd = final ? clean.length : Math.max(pp, clean.length - 9);
+      let nl;
+      while ((nl = clean.indexOf('\n', pp)) !== -1 && nl < safeEnd) {
+        unspin(); process.stdout.write(mdLine(clean.slice(pp, nl)) + '\n'); pp = nl + 1; shown = true;
+      }
+      if (final && pp < clean.length) { unspin(); process.stdout.write(mdLine(clean.slice(pp))); pp = clean.length; shown = true; }
     };
     while (true) {
       const { done, value } = await reader.read(); if (done) break;
@@ -144,18 +170,20 @@ async function think(messages) {
         if (!ln.startsWith('data:')) continue; const p = ln.slice(5).trim(); if (p === '[DONE]') continue;
         let tok = ''; try { tok = JSON.parse(p).choices?.[0]?.delta?.content || ''; } catch { continue; }
         if (!tok) continue;
-        if (!first) { first = true; stop(); }
         full += tok;
         if (!inCode) {
-          if (full.includes('```')) { inCode = true; flush(true); }
-          else { prose += tok; flush(false); }
+          if (full.includes('```')) {
+            inCode = true; flush(true);                       // emit any remaining prose
+            if (shown) process.stdout.write('\n');             // separate prose from the action below
+            spin();                                            // keep the indicator alive while the action generates
+          } else { prose += tok; flush(false); spin(); }       // re-arm the indicator between prose lines
         }
       }
     }
-    flush(true);
-    if (shown) process.stdout.write('\n');
+    flush(true); unspin();
+    if (shown && !inCode) process.stdout.write('\n');
     return full;
-  } finally { stop(); }
+  } finally { unspin(); }
 }
 // ── action protocol: model emits ONE fenced block per turn; first line is the command ──
 const VERBS = new Set(['list', 'search', 'read', 'edit', 'write', 'run', 'done']);
@@ -321,7 +349,7 @@ const LABELS = { read: 'Read', list: 'List', search: 'Search', edit: 'Update', w
 async function runTask(task, history) {
   console.log('');
   history.push({ role: 'user', content: task });
-  let ran = false, nudges = 0, lastRunFailed = false, doneNudges = 0, doneSummary = '';
+  let ran = false, nudges = 0, lastRunFailed = false, doneNudges = 0, doneSummary = '', doneBody = '';
   busy = true; interrupted = false;
   // is this a coding task (enforce actions) or chat/greeting (a prose reply is fine)?
   const isCoding = /\b(fix|bug|error|fail|implement|add|refactor|test|debug|rename|update|create|build|install|broken|crash|exception|traceback|function|class|import|run)\b/i.test(task) || /[\w./-]+\.\w{1,5}\b/.test(task);
@@ -344,7 +372,7 @@ async function runTask(task, history) {
     if (verb === 'done') {
       // don't accept "done" while the last command was still failing — that's a false finish
       if (lastRunFailed && doneNudges < 2) { doneNudges++; history.push({ role: 'user', content: 'The last command reported failures/errors, so the task is NOT verified. Keep fixing and re-run the test until it passes. If you are genuinely stuck, say plainly what is still broken instead of using `done`.' }); continue; }
-      ran = true; doneSummary = act.body.split('\n').map(s => s.trim()).filter(Boolean)[0] || ''; break;
+      ran = true; doneBody = act.body.trim(); doneSummary = doneBody.split('\n').map(s => s.trim()).filter(Boolean)[0] || ''; break;
     }
     const path0 = arg.split(/\s+/)[0] || '';
     const shown = verb === 'search' ? arg : (verb === 'run' ? (arg || act.body.split('\n')[0]) : path0);
@@ -376,7 +404,13 @@ async function runTask(task, history) {
   }
   } finally { busy = false; }
   if (interrupted) { interrupted = false; console.log(c.dim('  ⊘ stopped.') + '\n'); }
-  else if (ran) { if (isCoding) recordWork(task, doneSummary); console.log(MARK + ' ' + c.dim('done') + '\n'); }
+  else if (ran) {
+    if (isCoding) recordWork(task, doneSummary);
+    // Closing summary: print the model's done message (what it built + how to run it),
+    // markdown-rendered, instead of a bare "done".
+    if (doneBody) console.log(MARK + ' ' + c.b('done') + '\n' + doneBody.split('\n').map(l => '  ' + mdLine(l)).join('\n') + '\n');
+    else console.log(MARK + ' ' + c.dim('done') + '\n');
+  }
   else console.log('');
 }
 
@@ -528,11 +562,15 @@ Create a new file or fully overwrite one. Prefer edit for existing files.
 \`\`\`
 run python3 -m pytest -q
 \`\`\`
-Run a shell command (tests, build, repro).
+Run a shell command (tests, build, repro). To start a long-running server, background
+it and probe it, e.g. \`npm start & sleep 3 && curl -s localhost:3000\` — never run a
+server in the foreground; it would block.
 
 \`\`\`
 done
-one line on what you changed
+A short summary for the user: what you built or changed. If you started an app or a
+server, say exactly how to run and view it (e.g. "Run: npm start, then open
+http://localhost:3000"). A few lines is fine.
 \`\`\`
 Finish — ONLY after you verified the fix (ran the test/repro and it passed).
 

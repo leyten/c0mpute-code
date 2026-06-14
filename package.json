@@ -1,6 +1,6 @@
 {
   "name": "@c0mpute/code",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Decentralized coding agent — thinking runs on the c0mpute network, file edits and commands run locally under your approval. Claude Code-style UX, no single provider.",
   "license": "MIT",
   "type": "module",
